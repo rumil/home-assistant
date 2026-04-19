@@ -1,0 +1,98 @@
+blueprint:
+  name: Two-way synchronization Grenton - Light
+  description: Keeps the Grenton virtual switch in full synchronization with any light entity (loop and restart resistant).
+  domain: automation
+  input:
+    grenton_switch:
+      name: Grenton Virtual Switch
+      description: Choose the Grenton switch entity.
+      selector:
+        entity:
+          domain: switch
+    target_light:
+      name: Target Light
+      description: Choose the light entity, e.g., from a Shelly module.
+      selector:
+        entity:
+          domain: light
+
+mode: single
+
+trigger:
+  - platform: state
+    entity_id: !input grenton_switch
+    id: "grenton_changed"
+    not_to:
+      - unknown
+      - unavailable
+  - platform: state
+    entity_id: !input target_light
+    id: "light_changed"
+    not_to:
+      - unknown
+      - unavailable
+  - platform: homeassistant
+    event: start
+    id: "ha_start"
+
+action:
+  - choose:
+      # SCENARIO A: Change from Grenton -> Update Light
+      - conditions:
+          - condition: trigger
+            id: "grenton_changed"
+        sequence:
+          - choose:
+              - conditions:
+                  - condition: state
+                    entity_id: !input grenton_switch
+                    state: "on"
+                  - condition: state
+                    entity_id: !input target_light
+                    state: "off"
+                sequence:
+                  - service: light.turn_on
+                    target:
+                      entity_id: !input target_light
+              - conditions:
+                  - condition: state
+                    entity_id: !input grenton_switch
+                    state: "off"
+                  - condition: state
+                    entity_id: !input target_light
+                    state: "on"
+                sequence:
+                  - service: light.turn_off
+                    target:
+                      entity_id: !input target_light
+
+      # SCENARIO B: Change from Light OR HA restart -> Update Grenton
+      - conditions:
+          - condition: trigger
+            id:
+              - "light_changed"
+              - "ha_start"
+        sequence:
+          - choose:
+              - conditions:
+                  - condition: state
+                    entity_id: !input target_light
+                    state: "on"
+                  - condition: state
+                    entity_id: !input grenton_switch
+                    state: "off"
+                sequence:
+                  - service: switch.turn_on
+                    target:
+                      entity_id: !input grenton_switch
+              - conditions:
+                  - condition: state
+                    entity_id: !input target_light
+                    state: "off"
+                  - condition: state
+                    entity_id: !input grenton_switch
+                    state: "on"
+                sequence:
+                  - service: switch.turn_off
+                    target:
+                      entity_id: !input grenton_switch
