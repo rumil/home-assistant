@@ -1,6 +1,10 @@
 blueprint:
   name: Two-way synchronization Grenton - Light
-  description: Keeps the Grenton virtual switch in full synchronization with any light entity (loop and restart resistant).
+  description: >
+    Keeps the Grenton virtual switch in full synchronization with any light entity
+    (loop and restart resistant). The light entity is the source of truth on all
+    restarts and power outages. Normal user actions from either side are synced
+    bidirectionally.
   domain: automation
   input:
     grenton_switch:
@@ -19,25 +23,43 @@ blueprint:
 mode: single
 
 trigger:
+  # User action from Grenton side (real state → real state, not a restart)
   - platform: state
     entity_id: !input grenton_switch
     id: "grenton_changed"
+    not_from:
+      - unknown
+      - unavailable
     not_to:
       - unknown
       - unavailable
+
+  # Grenton restarted — its switch state is not reliable, light is source of truth
+  - platform: state
+    entity_id: !input grenton_switch
+    id: "grenton_recovered"
+    from:
+      - unknown
+      - unavailable
+    not_to:
+      - unknown
+      - unavailable
+
+  # Light state changed — also covers power outage recovery (from unavailable)
   - platform: state
     entity_id: !input target_light
     id: "light_changed"
     not_to:
       - unknown
       - unavailable
+
   - platform: homeassistant
     event: start
     id: "ha_start"
 
 action:
   - choose:
-      # SCENARIO A: Change from Grenton -> Update Light
+      # SCENARIO A: User action from Grenton → update light
       - conditions:
           - condition: trigger
             id: "grenton_changed"
@@ -66,11 +88,12 @@ action:
                     target:
                       entity_id: !input target_light
 
-      # SCENARIO B: Change from Light OR HA restart -> Update Grenton
+      # SCENARIO B: Light changed / Grenton recovered / HA restart → sync Grenton to light
       - conditions:
           - condition: trigger
             id:
               - "light_changed"
+              - "grenton_recovered"
               - "ha_start"
         sequence:
           - choose:
