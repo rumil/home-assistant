@@ -22,12 +22,18 @@ trigger:
   - platform: state
     entity_id: !input grenton_switch
     id: "grenton_changed"
+    not_from:
+      - unknown
+      - unavailable
     not_to:
       - unknown
       - unavailable
   - platform: state
     entity_id: !input target_light
     id: "light_changed"
+    not_from:
+      - unknown
+      - unavailable
     not_to:
       - unknown
       - unavailable
