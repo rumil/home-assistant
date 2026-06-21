@@ -79,8 +79,6 @@ action:
                   - service: light.turn_on
                     target:
                       entity_id: !input target_light
-                    data:
-                      transition: 0
               - conditions:
                   - condition: state
                     entity_id: !input grenton_switch
@@ -92,8 +90,6 @@ action:
                   - service: light.turn_off
                     target:
                       entity_id: !input target_light
-                    data:
-                      transition: 0
 
       # SCENARIO B: Light changed / Grenton recovered / HA restart → sync Grenton to light
       - conditions:
