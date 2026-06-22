@@ -2,9 +2,10 @@ blueprint:
   name: Two-way synchronization Grenton - Light
   description: >
     Keeps the Grenton virtual switch in full synchronization with any light entity
-    (loop and restart resistant). The light entity is the source of truth on all
-    restarts and power outages. Normal user actions from either side are synced
-    bidirectionally.
+    (loop and restart resistant). By default the light entity is the source of truth
+    on restarts and power outages. Normal user actions from either side are synced
+    bidirectionally. Optionally restores saved brightness and colour temperature on
+    power outage recovery.
   domain: automation
   input:
     grenton_switch:
@@ -19,6 +20,30 @@ blueprint:
       selector:
         entity:
           domain: light
+    post_outage_behavior:
+      name: Post-outage behavior
+      description: >
+        What to do when the light recovers from an unavailable state (power outage).
+        "Light as source of truth" preserves the original backward-compatible behavior.
+      default: light_source_of_truth
+      selector:
+        select:
+          options:
+            - label: "Light as source of truth (default)"
+              value: light_source_of_truth
+            - label: "Restore previous state (brightness & colour temperature)"
+              value: restore_previous
+            - label: "Always turn on"
+              value: turn_on
+            - label: "Always turn off"
+              value: turn_off
+
+variables:
+  target_light_id: !input target_light
+  grenton_switch_id: !input grenton_switch
+  post_outage_behavior: !input post_outage_behavior
+  # Unique per automation instance so multiple blueprints don't share a scene
+  saved_scene_id: "light_sync_saved_{{ this.entity_id | replace('.', '_') }}"
 
 mode: single
 
@@ -45,11 +70,22 @@ trigger:
       - unknown
       - unavailable
 
-  # Light state changed — also covers power outage recovery (from unavailable)
+  # Light state changed by user — real state to real state
   - platform: state
     entity_id: !input target_light
     id: "light_changed"
     not_from:
+      - unknown
+      - unavailable
+    not_to:
+      - unknown
+      - unavailable
+
+  # Light recovered from unavailable (power outage recovery while HA is running)
+  - platform: state
+    entity_id: !input target_light
+    id: "light_recovered"
+    from:
       - unknown
       - unavailable
     not_to:
@@ -90,12 +126,62 @@ action:
                   - service: light.turn_off
                     target:
                       entity_id: !input target_light
+          # Save scene after Grenton-driven light change
+          # (the resulting light_changed trigger is dropped by mode: single)
+          - if:
+              - condition: template
+                value_template: "{{ post_outage_behavior == 'restore_previous' }}"
+            then:
+              - wait_template: "{{ states(target_light_id) == states(grenton_switch_id) }}"
+                timeout: "00:00:03"
+              - service: scene.create
+                data:
+                  scene_id: "{{ saved_scene_id }}"
+                  snapshot_entities:
+                    - "{{ target_light_id }}"
 
-      # SCENARIO B: Light changed / Grenton recovered / HA restart → sync Grenton to light
+      # SCENARIO B: Light changed by user → sync Grenton + save scene
+      - conditions:
+          - condition: trigger
+            id: "light_changed"
+        sequence:
+          - choose:
+              - conditions:
+                  - condition: state
+                    entity_id: !input target_light
+                    state: "on"
+                  - condition: state
+                    entity_id: !input grenton_switch
+                    state: "off"
+                sequence:
+                  - service: switch.turn_on
+                    target:
+                      entity_id: !input grenton_switch
+              - conditions:
+                  - condition: state
+                    entity_id: !input target_light
+                    state: "off"
+                  - condition: state
+                    entity_id: !input grenton_switch
+                    state: "on"
+                sequence:
+                  - service: switch.turn_off
+                    target:
+                      entity_id: !input grenton_switch
+          - if:
+              - condition: template
+                value_template: "{{ post_outage_behavior == 'restore_previous' }}"
+            then:
+              - service: scene.create
+                data:
+                  scene_id: "{{ saved_scene_id }}"
+                  snapshot_entities:
+                    - "{{ target_light_id }}"
+
+      # SCENARIO C: Grenton recovered / HA restart → sync Grenton to light (light is source of truth)
       - conditions:
           - condition: trigger
             id:
-              - "light_changed"
               - "grenton_recovered"
               - "ha_start"
         sequence:
@@ -122,3 +208,103 @@ action:
                   - service: switch.turn_off
                     target:
                       entity_id: !input grenton_switch
+
+      # SCENARIO D: Light recovered from unavailable (power outage)
+      - conditions:
+          - condition: trigger
+            id: "light_recovered"
+        sequence:
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: "{{ post_outage_behavior == 'restore_previous' }}"
+                sequence:
+                  # Restore saved scene if it exists; if not, fall through to Grenton sync
+                  # which will trust the light's current (possibly buggy) reported state
+                  - if:
+                      - condition: template
+                        value_template: >
+                          {{ states.scene | selectattr('entity_id', 'equalto',
+                             'scene.' ~ saved_scene_id) | list | count > 0 }}
+                    then:
+                      - service: scene.turn_on
+                        target:
+                          entity_id: "scene.{{ saved_scene_id }}"
+                      # Give the light time to apply the scene before reading its state
+                      - delay: "00:00:01"
+                  # Sync Grenton to whatever the light now reports (restored or original)
+                  - choose:
+                      - conditions:
+                          - condition: state
+                            entity_id: !input target_light
+                            state: "on"
+                          - condition: state
+                            entity_id: !input grenton_switch
+                            state: "off"
+                        sequence:
+                          - service: switch.turn_on
+                            target:
+                              entity_id: !input grenton_switch
+                      - conditions:
+                          - condition: state
+                            entity_id: !input target_light
+                            state: "off"
+                          - condition: state
+                            entity_id: !input grenton_switch
+                            state: "on"
+                        sequence:
+                          - service: switch.turn_off
+                            target:
+                              entity_id: !input grenton_switch
+
+              - conditions:
+                  - condition: template
+                    value_template: "{{ post_outage_behavior == 'turn_on' }}"
+                sequence:
+                  - service: light.turn_on
+                    target:
+                      entity_id: !input target_light
+                  - wait_template: "{{ is_state(target_light_id, 'on') }}"
+                    timeout: "00:00:03"
+                  - service: switch.turn_on
+                    target:
+                      entity_id: !input grenton_switch
+
+              - conditions:
+                  - condition: template
+                    value_template: "{{ post_outage_behavior == 'turn_off' }}"
+                sequence:
+                  - service: light.turn_off
+                    target:
+                      entity_id: !input target_light
+                  - wait_template: "{{ is_state(target_light_id, 'off') }}"
+                    timeout: "00:00:03"
+                  - service: switch.turn_off
+                    target:
+                      entity_id: !input grenton_switch
+
+            # light_source_of_truth (default): trust what the light reports, sync Grenton
+            default:
+              - choose:
+                  - conditions:
+                      - condition: state
+                        entity_id: !input target_light
+                        state: "on"
+                      - condition: state
+                        entity_id: !input grenton_switch
+                        state: "off"
+                    sequence:
+                      - service: switch.turn_on
+                        target:
+                          entity_id: !input grenton_switch
+                  - conditions:
+                      - condition: state
+                        entity_id: !input target_light
+                        state: "off"
+                      - condition: state
+                        entity_id: !input grenton_switch
+                        state: "on"
+                    sequence:
+                      - service: switch.turn_off
+                        target:
+                          entity_id: !input grenton_switch
