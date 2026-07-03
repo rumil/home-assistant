@@ -209,6 +209,14 @@ action:
                             entity_id: !input target_light
                         timeout: "00:00:05"
                         continue_on_timeout: true
+                      # Capture whether the saved scene's target state is "off" so the loop
+                      # can use light.turn_off instead of scene.turn_on. scene.turn_on skips
+                      # the service call when the entity already matches the target state
+                      # (HA's async_reproduce_states optimisation), so no Zigbee command is
+                      # sent to late-joining bulbs that are physically on at 1%. light.turn_off
+                      # always forwards to the integration regardless of current HA state.
+                      - variables:
+                          restore_off: "{{ is_state(target_light_id, 'off') }}"
                       # Re-apply every 10 s for the full resync window to catch late Zigbee joiners
                       - if:
                           - condition: template
@@ -218,9 +226,17 @@ action:
                               count: "{{ [recovery_resync_delay | int // 10, 1] | max }}"
                               sequence:
                                 - delay: "00:00:10"
-                                - service: scene.turn_on
-                                  target:
-                                    entity_id: "scene.{{ saved_scene_id }}"
+                                - if:
+                                    - condition: template
+                                      value_template: "{{ restore_off }}"
+                                  then:
+                                    - service: light.turn_off
+                                      target:
+                                        entity_id: !input target_light
+                                  else:
+                                    - service: scene.turn_on
+                                      target:
+                                        entity_id: "scene.{{ saved_scene_id }}"
                                 - wait_for_trigger:
                                     - platform: state
                                       entity_id: !input target_light
@@ -342,6 +358,8 @@ action:
                             entity_id: !input target_light
                         timeout: "00:00:05"
                         continue_on_timeout: true
+                      - variables:
+                          restore_off: "{{ is_state(target_light_id, 'off') }}"
                       # Re-apply every 10 s for the full resync window to catch late Zigbee joiners
                       - if:
                           - condition: template
@@ -351,9 +369,17 @@ action:
                               count: "{{ [recovery_resync_delay | int // 10, 1] | max }}"
                               sequence:
                                 - delay: "00:00:10"
-                                - service: scene.turn_on
-                                  target:
-                                    entity_id: "scene.{{ saved_scene_id }}"
+                                - if:
+                                    - condition: template
+                                      value_template: "{{ restore_off }}"
+                                  then:
+                                    - service: light.turn_off
+                                      target:
+                                        entity_id: !input target_light
+                                  else:
+                                    - service: scene.turn_on
+                                      target:
+                                        entity_id: "scene.{{ saved_scene_id }}"
                                 - wait_for_trigger:
                                     - platform: state
                                       entity_id: !input target_light
