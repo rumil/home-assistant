@@ -230,6 +230,17 @@ action:
                                     - condition: template
                                       value_template: "{{ restore_off }}"
                                   then:
+                                    # Micro-toggle: Z2M/ZHA suppress the Zigbee "off" command
+                                    # when the group's internal state is already "off". Sending
+                                    # "on@1" first forces a real state transition (off→on), so
+                                    # the following "off" is always delivered as a Zigbee command.
+                                    # Brightness 1 (0.4%) is imperceptible on stuck bulbs at 1%.
+                                    - service: light.turn_on
+                                      target:
+                                        entity_id: !input target_light
+                                      data:
+                                        brightness: 1
+                                    - delay: "00:00:01"
                                     - service: light.turn_off
                                       target:
                                         entity_id: !input target_light
@@ -373,6 +384,12 @@ action:
                                     - condition: template
                                       value_template: "{{ restore_off }}"
                                   then:
+                                    - service: light.turn_on
+                                      target:
+                                        entity_id: !input target_light
+                                      data:
+                                        brightness: 1
+                                    - delay: "00:00:01"
                                     - service: light.turn_off
                                       target:
                                         entity_id: !input target_light
