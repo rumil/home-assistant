@@ -52,19 +52,19 @@ blueprint:
           max: 25
           step: 1
     recovery_resync_delay:
-      name: Recovery resync delay in seconds (0 = disabled)
+      name: Recovery resync window in seconds (0 = disabled)
       description: >
-        After restoring the saved state on boot recovery, wait this many seconds
-        then apply the saved state again. This catches Zigbee bulbs that joined
-        the mesh too late to receive the first command — they physically stay on
-        at boot brightness even though the group entity already shows the correct
-        state. Set to 0 to disable the second apply. Recommended: 15–30 s.
-      default: 15
+        Total window in seconds during which the saved state is re-applied once
+        every 10 seconds. This catches Zigbee bulbs that re-join the mesh slowly
+        and miss earlier commands — mode:single is held throughout, so late-boot
+        triggers are also suppressed while the loop runs. Set to 0 to disable.
+        Recommended: 90 s (covers meshes that take over a minute to fully rejoin).
+      default: 90
       selector:
         number:
           min: 0
-          max: 60
-          step: 5
+          max: 180
+          step: 10
           unit_of_measurement: s
 
 variables:
@@ -188,8 +188,7 @@ action:
                    trigger.to_state.state == 'on' and
                    trigger.to_state.attributes.get('brightness', 256) | int
                      <= recovery_brightness_threshold | int and
-                   trigger.to_state.context.user_id is none and
-                   trigger.to_state.context.parent_id is none }}
+                   trigger.to_state.context.user_id is none }}
           - choose:
               # Boot-recovery path: restore the saved scene, then sync Grenton
               - conditions:
@@ -210,21 +209,23 @@ action:
                             entity_id: !input target_light
                         timeout: "00:00:05"
                         continue_on_timeout: true
-                      # Hold mode:single open then re-apply for late Zigbee joiners
+                      # Re-apply every 10 s for the full resync window to catch late Zigbee joiners
                       - if:
                           - condition: template
                             value_template: "{{ recovery_resync_delay | int > 0 }}"
                         then:
-                          - delay:
-                              seconds: "{{ recovery_resync_delay | int }}"
-                          - service: scene.turn_on
-                            target:
-                              entity_id: "scene.{{ saved_scene_id }}"
-                          - wait_for_trigger:
-                              - platform: state
-                                entity_id: !input target_light
-                            timeout: "00:00:05"
-                            continue_on_timeout: true
+                          - repeat:
+                              count: "{{ [recovery_resync_delay | int // 10, 1] | max }}"
+                              sequence:
+                                - delay: "00:00:10"
+                                - service: scene.turn_on
+                                  target:
+                                    entity_id: "scene.{{ saved_scene_id }}"
+                                - wait_for_trigger:
+                                    - platform: state
+                                      entity_id: !input target_light
+                                  timeout: "00:00:05"
+                                  continue_on_timeout: true
                   - choose:
                       - conditions:
                           - condition: state
@@ -341,21 +342,23 @@ action:
                             entity_id: !input target_light
                         timeout: "00:00:05"
                         continue_on_timeout: true
-                      # Hold mode:single open then re-apply for late Zigbee joiners
+                      # Re-apply every 10 s for the full resync window to catch late Zigbee joiners
                       - if:
                           - condition: template
                             value_template: "{{ recovery_resync_delay | int > 0 }}"
                         then:
-                          - delay:
-                              seconds: "{{ recovery_resync_delay | int }}"
-                          - service: scene.turn_on
-                            target:
-                              entity_id: "scene.{{ saved_scene_id }}"
-                          - wait_for_trigger:
-                              - platform: state
-                                entity_id: !input target_light
-                            timeout: "00:00:05"
-                            continue_on_timeout: true
+                          - repeat:
+                              count: "{{ [recovery_resync_delay | int // 10, 1] | max }}"
+                              sequence:
+                                - delay: "00:00:10"
+                                - service: scene.turn_on
+                                  target:
+                                    entity_id: "scene.{{ saved_scene_id }}"
+                                - wait_for_trigger:
+                                    - platform: state
+                                      entity_id: !input target_light
+                                  timeout: "00:00:05"
+                                  continue_on_timeout: true
                   # Sync Grenton to whatever the light now reports (restored or original)
                   - choose:
                       - conditions:
