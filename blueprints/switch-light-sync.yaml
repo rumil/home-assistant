@@ -188,7 +188,7 @@ action:
                    trigger.to_state.state == 'on' and
                    trigger.to_state.attributes.get('brightness', 0) | int
                      <= recovery_brightness_threshold | int and
-                   trigger.to_state.context.user_id is none }}
+                   context.user_id is none }}
           - choose:
               # Boot-recovery path: restore the saved scene, then sync Grenton
               - conditions:
