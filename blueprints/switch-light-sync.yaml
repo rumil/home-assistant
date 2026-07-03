@@ -51,12 +51,28 @@ blueprint:
           min: 0
           max: 25
           step: 1
+    recovery_resync_delay:
+      name: Recovery resync delay in seconds (0 = disabled)
+      description: >
+        After restoring the saved state on boot recovery, wait this many seconds
+        then apply the saved state again. This catches Zigbee bulbs that joined
+        the mesh too late to receive the first command — they physically stay on
+        at boot brightness even though the group entity already shows the correct
+        state. Set to 0 to disable the second apply. Recommended: 15–30 s.
+      default: 15
+      selector:
+        number:
+          min: 0
+          max: 60
+          step: 5
+          unit_of_measurement: s
 
 variables:
   target_light_id: !input target_light
   grenton_switch_id: !input grenton_switch
   post_outage_behavior: !input post_outage_behavior
   recovery_brightness_threshold: !input recovery_brightness_threshold
+  recovery_resync_delay: !input recovery_resync_delay
   # Unique per automation instance so multiple blueprints don't share a scene
   saved_scene_id: "light_sync_saved_{{ this.entity_id | replace('.', '_') }}"
 
@@ -192,6 +208,21 @@ action:
                             entity_id: !input target_light
                         timeout: "00:00:05"
                         continue_on_timeout: true
+                      # Hold mode:single open then re-apply for late Zigbee joiners
+                      - if:
+                          - condition: template
+                            value_template: "{{ recovery_resync_delay | int > 0 }}"
+                        then:
+                          - delay:
+                              seconds: "{{ recovery_resync_delay | int }}"
+                          - service: scene.turn_on
+                            target:
+                              entity_id: "scene.{{ saved_scene_id }}"
+                          - wait_for_trigger:
+                              - platform: state
+                                entity_id: !input target_light
+                            timeout: "00:00:05"
+                            continue_on_timeout: true
                   - choose:
                       - conditions:
                           - condition: state
@@ -308,6 +339,21 @@ action:
                             entity_id: !input target_light
                         timeout: "00:00:05"
                         continue_on_timeout: true
+                      # Hold mode:single open then re-apply for late Zigbee joiners
+                      - if:
+                          - condition: template
+                            value_template: "{{ recovery_resync_delay | int > 0 }}"
+                        then:
+                          - delay:
+                              seconds: "{{ recovery_resync_delay | int }}"
+                          - service: scene.turn_on
+                            target:
+                              entity_id: "scene.{{ saved_scene_id }}"
+                          - wait_for_trigger:
+                              - platform: state
+                                entity_id: !input target_light
+                            timeout: "00:00:05"
+                            continue_on_timeout: true
                   # Sync Grenton to whatever the light now reports (restored or original)
                   - choose:
                       - conditions:
