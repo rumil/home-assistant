@@ -51,28 +51,12 @@ blueprint:
           min: 0
           max: 25
           step: 1
-    recovery_resync_delay:
-      name: Recovery resync window in seconds (0 = disabled)
-      description: >
-        Total window in seconds during which the saved state is re-applied once
-        every 10 seconds. This catches Zigbee bulbs that re-join the mesh slowly
-        and miss earlier commands — mode:single is held throughout, so late-boot
-        triggers are also suppressed while the loop runs. Set to 0 to disable.
-        Recommended: 90 s (covers meshes that take over a minute to fully rejoin).
-      default: 90
-      selector:
-        number:
-          min: 0
-          max: 180
-          step: 10
-          unit_of_measurement: s
 
 variables:
   target_light_id: !input target_light
   grenton_switch_id: !input grenton_switch
   post_outage_behavior: !input post_outage_behavior
   recovery_brightness_threshold: !input recovery_brightness_threshold
-  recovery_resync_delay: !input recovery_resync_delay
   # Unique per automation instance so multiple blueprints don't share a scene
   saved_scene_id: "light_sync_saved_{{ this.entity_id | replace('.', '_') }}"
 
@@ -177,16 +161,19 @@ action:
           - condition: trigger
             id: "light_changed"
         sequence:
+          # Zigbee group entities report state "on" first; the brightness attribute
+          # arrives in a separate update ~500 ms later. Wait 1 s so that state_attr
+          # reads the settled brightness rather than the stale trigger snapshot.
+          - delay: "00:00:01"
           - variables:
-              # Detect firmware boot: light came on from off at suspiciously low brightness.
-              # Group entities never go unavailable on a brief cut, so light_recovered won't
-              # fire — this is our only chance to catch the outage before the scene is saved.
+              # Detect firmware boot: light came on from off at suspiciously low brightness
+              # with no HA user context (device-reported state change, not a UI action).
               is_boot_recovery: >
                 {{ post_outage_behavior == 'restore_previous' and
                    recovery_brightness_threshold | int > 0 and
                    trigger.from_state.state == 'off' and
                    trigger.to_state.state == 'on' and
-                   trigger.to_state.attributes.get('brightness', 0) | int
+                   state_attr(target_light_id, 'brightness') | int(0)
                      <= recovery_brightness_threshold | int and
                    context.user_id is none }}
           - choose:
@@ -204,55 +191,6 @@ action:
                       - service: scene.turn_on
                         target:
                           entity_id: "scene.{{ saved_scene_id }}"
-                      - wait_for_trigger:
-                          - platform: state
-                            entity_id: !input target_light
-                        timeout: "00:00:05"
-                        continue_on_timeout: true
-                      # Capture whether the saved scene's target state is "off" so the loop
-                      # can use light.turn_off instead of scene.turn_on. scene.turn_on skips
-                      # the service call when the entity already matches the target state
-                      # (HA's async_reproduce_states optimisation), so no Zigbee command is
-                      # sent to late-joining bulbs that are physically on at 1%. light.turn_off
-                      # always forwards to the integration regardless of current HA state.
-                      - variables:
-                          restore_off: "{{ is_state(target_light_id, 'off') }}"
-                      # Re-apply every 10 s for the full resync window to catch late Zigbee joiners
-                      - if:
-                          - condition: template
-                            value_template: "{{ recovery_resync_delay | int > 0 }}"
-                        then:
-                          - repeat:
-                              count: "{{ [recovery_resync_delay | int // 10, 1] | max }}"
-                              sequence:
-                                - delay: "00:00:10"
-                                - if:
-                                    - condition: template
-                                      value_template: "{{ restore_off }}"
-                                  then:
-                                    # Micro-toggle: Z2M/ZHA suppress the Zigbee "off" command
-                                    # when the group's internal state is already "off". Sending
-                                    # "on@1" first forces a real state transition (off→on), so
-                                    # the following "off" is always delivered as a Zigbee command.
-                                    # Brightness 1 (0.4%) is imperceptible on stuck bulbs at 1%.
-                                    - service: light.turn_on
-                                      target:
-                                        entity_id: !input target_light
-                                      data:
-                                        brightness: 1
-                                    - delay: "00:00:01"
-                                    - service: light.turn_off
-                                      target:
-                                        entity_id: !input target_light
-                                  else:
-                                    - service: scene.turn_on
-                                      target:
-                                        entity_id: "scene.{{ saved_scene_id }}"
-                                - wait_for_trigger:
-                                    - platform: state
-                                      entity_id: !input target_light
-                                  timeout: "00:00:05"
-                                  continue_on_timeout: true
                   - choose:
                       - conditions:
                           - condition: state
@@ -352,8 +290,6 @@ action:
                   - condition: template
                     value_template: "{{ post_outage_behavior == 'restore_previous' }}"
                 sequence:
-                  # Restore saved scene if it exists; if not, fall through to Grenton sync
-                  # which will trust the light's current (possibly buggy) reported state
                   - if:
                       - condition: template
                         value_template: >
@@ -363,46 +299,6 @@ action:
                       - service: scene.turn_on
                         target:
                           entity_id: "scene.{{ saved_scene_id }}"
-                      # Wait for the light to apply the scene (Zigbee can take 2-3 s)
-                      - wait_for_trigger:
-                          - platform: state
-                            entity_id: !input target_light
-                        timeout: "00:00:05"
-                        continue_on_timeout: true
-                      - variables:
-                          restore_off: "{{ is_state(target_light_id, 'off') }}"
-                      # Re-apply every 10 s for the full resync window to catch late Zigbee joiners
-                      - if:
-                          - condition: template
-                            value_template: "{{ recovery_resync_delay | int > 0 }}"
-                        then:
-                          - repeat:
-                              count: "{{ [recovery_resync_delay | int // 10, 1] | max }}"
-                              sequence:
-                                - delay: "00:00:10"
-                                - if:
-                                    - condition: template
-                                      value_template: "{{ restore_off }}"
-                                  then:
-                                    - service: light.turn_on
-                                      target:
-                                        entity_id: !input target_light
-                                      data:
-                                        brightness: 1
-                                    - delay: "00:00:01"
-                                    - service: light.turn_off
-                                      target:
-                                        entity_id: !input target_light
-                                  else:
-                                    - service: scene.turn_on
-                                      target:
-                                        entity_id: "scene.{{ saved_scene_id }}"
-                                - wait_for_trigger:
-                                    - platform: state
-                                      entity_id: !input target_light
-                                  timeout: "00:00:05"
-                                  continue_on_timeout: true
-                  # Sync Grenton to whatever the light now reports (restored or original)
                   - choose:
                       - conditions:
                           - condition: state
