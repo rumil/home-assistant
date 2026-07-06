@@ -182,6 +182,15 @@ action:
                   - condition: template
                     value_template: "{{ is_boot_recovery }}"
                 sequence:
+                  # TS0502B (and similar) firmware queues off commands while in 1% boot state
+                  # but won't execute them until a turn_on wakes the device. Send a brief
+                  # turn_on first so the subsequent scene restore is accepted.
+                  - service: light.turn_on
+                    target:
+                      entity_id: !input target_light
+                    data:
+                      brightness: 128
+                  - delay: "00:00:02"
                   - if:
                       - condition: template
                         value_template: >
