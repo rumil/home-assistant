@@ -189,7 +189,7 @@ action:
                     target:
                       entity_id: !input target_light
                     data:
-                      brightness: 128
+                      brightness: 255
                   - delay: "00:00:02"
                   - if:
                       - condition: template
