@@ -57,8 +57,8 @@ variables:
   grenton_switch_id: !input grenton_switch
   post_outage_behavior: !input post_outage_behavior
   recovery_brightness_threshold: !input recovery_brightness_threshold
-  # Unique per automation instance so multiple blueprints don't share a scene
-  saved_scene_id: "light_sync_saved_{{ this.entity_id | replace('.', '_') }}"
+  # Unique per automation instance; friendly_name gives a readable name in HA Scenes UI
+  saved_scene_id: "light_sync_saved_{{ this.attributes.friendly_name | slugify }}"
 
 mode: single
 
@@ -299,11 +299,33 @@ action:
                   - condition: template
                     value_template: "{{ post_outage_behavior == 'restore_previous' }}"
                 sequence:
+                  # unavailable→off→on: device is mid-boot (e.g. TS0502B starts at 1%).
+                  # Hold mode:single while waiting so Scenario B's off→on trigger is blocked.
+                  # Once "on" is confirmed, issue a 100% wake-up to flush any queued off commands.
+                  - if:
+                      - condition: template
+                        value_template: "{{ trigger.to_state.state == 'off' }}"
+                    then:
+                      - wait_template: "{{ states(target_light_id) == 'on' }}"
+                        timeout: "00:00:10"
+                      - if:
+                          - condition: template
+                            value_template: "{{ wait.completed }}"
+                        then:
+                          - service: light.turn_on
+                            target:
+                              entity_id: !input target_light
+                            data:
+                              brightness: 255
+                          - delay: "00:00:02"
+                  # Only restore the scene if the light is currently on (either directly
+                  # recovered as "on", or just woken up above). Skip if boot failed/timed out.
                   - if:
                       - condition: template
                         value_template: >
-                          {{ states.scene | selectattr('entity_id', 'equalto',
-                             'scene.' ~ saved_scene_id) | list | count > 0 }}
+                          {{ states(target_light_id) == 'on' and
+                             states.scene | selectattr('entity_id', 'equalto',
+                                'scene.' ~ saved_scene_id) | list | count > 0 }}
                     then:
                       - service: scene.turn_on
                         target:
