@@ -265,6 +265,37 @@ action:
               - "grenton_recovered"
               - "ha_start"
         sequence:
+          # On HA restart only: if the light is already on at ≤ threshold brightness it is in
+          # firmware boot state (TS0502B and similar boot at 1%). Wake it up and restore the
+          # saved scene before syncing Grenton, so the 0%-brightness stuck state is fixed
+          # automatically without requiring a manual toggle.
+          - if:
+              - condition: template
+                value_template: >
+                  {{ trigger.id == 'ha_start' and
+                     post_outage_behavior == 'restore_previous' and
+                     recovery_brightness_threshold | int > 0 and
+                     is_state(target_light_id, 'on') and
+                     state_attr(target_light_id, 'brightness') | int(0)
+                       <= recovery_brightness_threshold | int }}
+            then:
+              - service: light.turn_on
+                target:
+                  entity_id: !input target_light
+                data:
+                  brightness: 255
+              - delay: "00:00:02"
+              - if:
+                  - condition: template
+                    value_template: >
+                      {{ states.scene | selectattr('entity_id', 'equalto',
+                         'scene.' ~ saved_scene_id) | list | count > 0 }}
+                then:
+                  - service: scene.turn_on
+                    target:
+                      entity_id: "scene.{{ saved_scene_id }}"
+              # Let the scene change settle before reading state for Grenton sync
+              - delay: "00:00:01"
           - choose:
               - conditions:
                   - condition: state
