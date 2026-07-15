@@ -4,9 +4,11 @@ blueprint:
     Keeps the Grenton virtual switch in full synchronization with any light entity
     (loop and restart resistant). By default the light entity is the source of truth
     on restarts and power outages. Normal user actions from either side are synced
-    bidirectionally. Optionally restores saved brightness and colour temperature on
-    power outage recovery.
+    bidirectionally. Optionally restores a saved snapshot (configurable attributes)
+    on power-outage recovery, persisted to an input_text helper so it survives a
+    Home Assistant restart.
   domain: automation
+  source_url: https://raw.githubusercontent.com/rumil/home-assistant/refs/heads/main/blueprints/switch-light-sync.yaml
   input:
     grenton_switch:
       name: Grenton Virtual Switch
@@ -31,20 +33,55 @@ blueprint:
           options:
             - label: "Light as source of truth (default)"
               value: light_source_of_truth
-            - label: "Restore previous state (brightness & colour temperature)"
+            - label: "Restore previous state (saved snapshot)"
               value: restore_previous
             - label: "Always turn on"
               value: turn_on
             - label: "Always turn off"
               value: turn_off
+    state_store:
+      name: State store (input_text helper)
+      description: >
+        Only relevant when "Restore previous state" is selected. A dedicated
+        input_text helper (max length 255) used to persist the saved light state as
+        JSON so it survives a Home Assistant restart. Create one helper per
+        automation instance. Leave empty to disable persistence (no restore).
+      default: ""
+      selector:
+        entity:
+          domain: input_text
+    saved_attributes:
+      name: Attributes to save & restore
+      description: >
+        Only relevant when "Restore previous state" is selected. Which light
+        attributes to snapshot and restore. Attributes the light does not currently
+        expose are skipped automatically, so it is safe to list more than a given
+        light supports. Add custom entries for any attribute your light reports.
+      default:
+        - brightness
+        - color_temp_kelvin
+      selector:
+        select:
+          multiple: true
+          custom_value: true
+          options:
+            - brightness
+            - color_temp_kelvin
+            - rgb_color
+            - rgbw_color
+            - rgbww_color
+            - hs_color
+            - xy_color
+            - effect
     recovery_brightness_threshold:
       name: Recovery brightness threshold (0 = disabled)
       description: >
-        Only relevant when "Restore previous state" is selected. If the light turns
-        on from off with a brightness at or below this value (0–255 scale), it is
-        treated as a firmware boot rather than a user action and the saved state is
-        restored. Use this for lights whose firmware boots at 1 % (brightness ≈ 3).
-        Set to 0 to disable (rely only on unavailable-state detection).
+        Only relevant when "Restore previous state" is selected. If the light comes
+        back on at a brightness at or below this value (0–255 scale), it is treated
+        as a firmware boot rather than a user action: the device is woken to 100 %
+        (to flush the stuck boot state) and the saved snapshot is restored. Use this
+        for lights whose firmware boots at 1 % (brightness ≈ 3). Set to 0 to disable
+        (rely only on unavailable-state detection).
       default: 0
       selector:
         number:
@@ -57,8 +94,19 @@ variables:
   grenton_switch_id: !input grenton_switch
   post_outage_behavior: !input post_outage_behavior
   recovery_brightness_threshold: !input recovery_brightness_threshold
-  # Unique per automation instance; friendly_name gives a readable name in HA Scenes UI
-  saved_scene_id: "light_sync_saved_{{ this.attributes.friendly_name | slugify }}"
+  state_store_id: !input state_store
+  saved_attributes: !input saved_attributes
+  # Whether a persistent state store is configured.
+  has_store: "{{ state_store_id not in ['', 'unknown', 'unavailable', none] }}"
+  # The saved snapshot (parsed from the store), read once at run start. Empty dict
+  # when no store is configured or the store holds no valid JSON yet.
+  saved: >-
+    {{ states(state_store_id) | from_json(default={}) if has_store else {} }}
+  # The saved attributes as a light.turn_on data dict (snapshot minus the 'state' key).
+  restore_data: >-
+    {% set ns = namespace(d={}) %}
+    {%- for k, v in saved.items() if k != 'state' %}{% set ns.d = dict(ns.d, **{k: v}) %}{%- endfor %}
+    {{ ns.d }}
 
 mode: single
 
@@ -107,6 +155,14 @@ trigger:
       - unknown
       - unavailable
 
+  # Brightness changed while the light stayed "on" (no off/unavailable transition).
+  # Catches a firmware boot that drops to ~1% and reports no state-string change, so
+  # none of the state triggers above would fire.
+  - platform: state
+    entity_id: !input target_light
+    attribute: brightness
+    id: "light_low"
+
   - platform: homeassistant
     event: start
     id: "ha_start"
@@ -141,65 +197,113 @@ action:
                   - service: light.turn_off
                     target:
                       entity_id: !input target_light
-          # Save scene after Grenton-driven light change
+          # Save snapshot after Grenton-driven light change
           # (the resulting light_changed trigger is dropped by mode: single)
           - if:
               - condition: template
-                value_template: "{{ post_outage_behavior == 'restore_previous' }}"
+                value_template: "{{ post_outage_behavior == 'restore_previous' and has_store }}"
             then:
               - wait_template: "{{ states(target_light_id) == states(grenton_switch_id) }}"
                 timeout: "00:00:03"
-              - service: scene.create
-                data:
-                  scene_id: "{{ saved_scene_id }}"
-                  snapshot_entities:
-                    - "{{ target_light_id }}"
+              # Let brightness/colour attributes settle before snapshotting
+              - delay: "00:00:01"
+              # Never persist a device-reported low/boot brightness as the saved state.
+              - if:
+                  - condition: template
+                    value_template: >-
+                      {{ states(target_light_id) in ['on', 'off'] and
+                         not (is_state(target_light_id, 'on') and
+                              state_attr(target_light_id, 'brightness') | int(0)
+                                <= recovery_brightness_threshold | int and
+                              context.user_id is none) }}
+                then:
+                  - variables:
+                      snapshot_json: >-
+                        {% set st = states(target_light_id) %}
+                        {%- set ns = namespace(d={'state': st}) %}
+                        {%- if st == 'on' %}
+                        {%- for a in saved_attributes %}
+                        {%- set v = state_attr(target_light_id, a) %}
+                        {%- if v is not none %}{% set ns.d = dict(ns.d, **{a: v}) %}{% endif %}
+                        {%- endfor %}
+                        {%- endif %}
+                        {{ ns.d | to_json }}
+                  - service: input_text.set_value
+                    target:
+                      entity_id: !input state_store
+                    data:
+                      value: "{{ snapshot_json | trim }}"
 
-      # SCENARIO B: Light changed — either a real user action or a firmware boot after
-      # a brief power cut (group entities may go off→on without passing through unavailable)
+      # SCENARIO B: Light changed (on/off) OR its brightness changed while staying on.
+      # Covers a real user action, a firmware boot that arrives as off→on, AND a firmware
+      # boot that drops the brightness to ~1% with no off/unavailable transition (an
+      # attribute-only change caught by the "light_low" brightness trigger). Both triggers
+      # can fire for one on/off event; the handler recomputes from current state so the
+      # outcome is identical whichever one wins under mode:single.
       - conditions:
           - condition: trigger
-            id: "light_changed"
+            id:
+              - "light_changed"
+              - "light_low"
         sequence:
           # Zigbee group entities report state "on" first; the brightness attribute
           # arrives in a separate update ~500 ms later. Wait 1 s so that state_attr
           # reads the settled brightness rather than the stale trigger snapshot.
           - delay: "00:00:01"
           - variables:
-              # Detect firmware boot: light came on from off at suspiciously low brightness
-              # with no HA user context (device-reported state change, not a UI action).
+              cur_on: "{{ is_state(target_light_id, 'on') }}"
+              cur_bri: "{{ state_attr(target_light_id, 'brightness') | int(0) }}"
+              from_bri: >-
+                {{ (trigger.from_state.attributes.get('brightness', 0)
+                    if trigger.from_state is not none else 0) | int(0) }}
+              from_on: "{{ trigger.from_state is not none and trigger.from_state.state == 'on' }}"
+              # Firmware boot heuristic: the light is now on at/below the boot threshold, it
+              # just DROPPED into that low zone (a repeated low→low report is ignored so the
+              # device fighting back can't create a wake/restore loop), and no HA user
+              # initiated the change (device-reported, context.user_id is none).
               is_boot_recovery: >
                 {{ post_outage_behavior == 'restore_previous' and
                    recovery_brightness_threshold | int > 0 and
-                   trigger.from_state.state == 'off' and
-                   trigger.to_state.state == 'on' and
-                   state_attr(target_light_id, 'brightness') | int(0)
-                     <= recovery_brightness_threshold | int and
+                   cur_on and
+                   cur_bri <= recovery_brightness_threshold | int and
+                   (not from_on or from_bri > recovery_brightness_threshold | int) and
                    context.user_id is none }}
           - choose:
-              # Boot-recovery path: restore the saved scene, then sync Grenton
+              # Boot-recovery path: wake the device, restore the saved snapshot, sync Grenton
               - conditions:
                   - condition: template
                     value_template: "{{ is_boot_recovery }}"
                 sequence:
-                  # TS0502B (and similar) firmware queues off commands while in 1% boot state
+                  # TS0502B (and similar) firmware queues commands while in 1% boot state
                   # but won't execute them until a turn_on wakes the device. Send a brief
-                  # turn_on first so the subsequent scene restore is accepted.
+                  # 100% turn_on first so the subsequent snapshot restore is accepted.
                   - service: light.turn_on
                     target:
                       entity_id: !input target_light
                     data:
                       brightness: 255
                   - delay: "00:00:02"
+                  # Restore the persisted snapshot, if we have one.
                   - if:
                       - condition: template
-                        value_template: >
-                          {{ states.scene | selectattr('entity_id', 'equalto',
-                             'scene.' ~ saved_scene_id) | list | count > 0 }}
+                        value_template: "{{ has_store and saved.get('state') is not none }}"
                     then:
-                      - service: scene.turn_on
-                        target:
-                          entity_id: "scene.{{ saved_scene_id }}"
+                      - choose:
+                          - conditions:
+                              - condition: template
+                                value_template: "{{ saved.get('state') == 'on' }}"
+                            sequence:
+                              - service: light.turn_on
+                                target:
+                                  entity_id: !input target_light
+                                data: "{{ restore_data }}"
+                          - conditions:
+                              - condition: template
+                                value_template: "{{ saved.get('state') == 'off' }}"
+                            sequence:
+                              - service: light.turn_off
+                                target:
+                                  entity_id: !input target_light
                   - choose:
                       - conditions:
                           - condition: state
@@ -223,7 +327,7 @@ action:
                           - service: switch.turn_off
                             target:
                               entity_id: !input grenton_switch
-            # Normal user action: sync Grenton, save scene
+            # Normal user action: sync Grenton, save snapshot
             default:
               - choose:
                   - conditions:
@@ -248,15 +352,33 @@ action:
                       - service: switch.turn_off
                         target:
                           entity_id: !input grenton_switch
+              # Save the new state — but never persist a device-reported low/boot
+              # brightness (cur_on & low & no user context) as the saved snapshot.
               - if:
                   - condition: template
-                    value_template: "{{ post_outage_behavior == 'restore_previous' }}"
+                    value_template: >-
+                      {{ post_outage_behavior == 'restore_previous' and has_store and
+                         states(target_light_id) in ['on', 'off'] and
+                         not (cur_on and
+                              cur_bri <= recovery_brightness_threshold | int and
+                              context.user_id is none) }}
                 then:
-                  - service: scene.create
+                  - variables:
+                      snapshot_json: >-
+                        {% set st = states(target_light_id) %}
+                        {%- set ns = namespace(d={'state': st}) %}
+                        {%- if st == 'on' %}
+                        {%- for a in saved_attributes %}
+                        {%- set v = state_attr(target_light_id, a) %}
+                        {%- if v is not none %}{% set ns.d = dict(ns.d, **{a: v}) %}{% endif %}
+                        {%- endfor %}
+                        {%- endif %}
+                        {{ ns.d | to_json }}
+                  - service: input_text.set_value
+                    target:
+                      entity_id: !input state_store
                     data:
-                      scene_id: "{{ saved_scene_id }}"
-                      snapshot_entities:
-                        - "{{ target_light_id }}"
+                      value: "{{ snapshot_json | trim }}"
 
       # SCENARIO C: Grenton recovered / HA restart → sync Grenton to light (light is source of truth)
       - conditions:
@@ -267,13 +389,14 @@ action:
         sequence:
           # On HA restart only: if the light is already on at ≤ threshold brightness it is in
           # firmware boot state (TS0502B and similar boot at 1%). Wake it up and restore the
-          # saved scene before syncing Grenton, so the 0%-brightness stuck state is fixed
-          # automatically without requiring a manual toggle.
+          # saved snapshot before syncing Grenton, so the 0%-brightness stuck state is fixed
+          # automatically without requiring a manual toggle. (If the light is still
+          # unavailable at startup, the later light_recovered trigger handles it instead.)
           - if:
               - condition: template
                 value_template: >
                   {{ trigger.id == 'ha_start' and
-                     post_outage_behavior == 'restore_previous' and
+                     post_outage_behavior == 'restore_previous' and has_store and
                      recovery_brightness_threshold | int > 0 and
                      is_state(target_light_id, 'on') and
                      state_attr(target_light_id, 'brightness') | int(0)
@@ -287,14 +410,25 @@ action:
               - delay: "00:00:02"
               - if:
                   - condition: template
-                    value_template: >
-                      {{ states.scene | selectattr('entity_id', 'equalto',
-                         'scene.' ~ saved_scene_id) | list | count > 0 }}
+                    value_template: "{{ saved.get('state') is not none }}"
                 then:
-                  - service: scene.turn_on
-                    target:
-                      entity_id: "scene.{{ saved_scene_id }}"
-              # Let the scene change settle before reading state for Grenton sync
+                  - choose:
+                      - conditions:
+                          - condition: template
+                            value_template: "{{ saved.get('state') == 'on' }}"
+                        sequence:
+                          - service: light.turn_on
+                            target:
+                              entity_id: !input target_light
+                            data: "{{ restore_data }}"
+                      - conditions:
+                          - condition: template
+                            value_template: "{{ saved.get('state') == 'off' }}"
+                        sequence:
+                          - service: light.turn_off
+                            target:
+                              entity_id: !input target_light
+              # Let the restore settle before reading state for Grenton sync
               - delay: "00:00:01"
           - choose:
               - conditions:
@@ -330,37 +464,57 @@ action:
                   - condition: template
                     value_template: "{{ post_outage_behavior == 'restore_previous' }}"
                 sequence:
-                  # unavailable→off→on: device is mid-boot (e.g. TS0502B starts at 1%).
+                  # Let brightness settle after recovery before reading it (parity with
+                  # Scenario B), so a momentarily-missing brightness isn't misread as low.
+                  - delay: "00:00:01"
+                  # If it recovered as 'off' it may be mid-boot (e.g. TS0502B starts at 1%).
                   # Hold mode:single while waiting so Scenario B's off→on trigger is blocked.
-                  # Once "on" is confirmed, issue a 100% wake-up to flush any queued off commands.
                   - if:
                       - condition: template
                         value_template: "{{ trigger.to_state.state == 'off' }}"
                     then:
                       - wait_template: "{{ states(target_light_id) == 'on' }}"
                         timeout: "00:00:10"
-                      - if:
-                          - condition: template
-                            value_template: "{{ wait.completed }}"
-                        then:
-                          - service: light.turn_on
-                            target:
-                              entity_id: !input target_light
-                            data:
-                              brightness: 255
-                          - delay: "00:00:02"
-                  # Only restore the scene if the light is currently on (either directly
-                  # recovered as "on", or just woken up above). Skip if boot failed/timed out.
+                  # Whether the device recovered directly to 'on' at 1% or was just woken
+                  # above, if it is on at ≤ threshold brightness it is in the stuck firmware
+                  # boot state. Send a 100% wake-up to flush queued commands so the snapshot
+                  # restore below is actually accepted.
                   - if:
                       - condition: template
                         value_template: >
-                          {{ states(target_light_id) == 'on' and
-                             states.scene | selectattr('entity_id', 'equalto',
-                                'scene.' ~ saved_scene_id) | list | count > 0 }}
+                          {{ recovery_brightness_threshold | int > 0 and
+                             is_state(target_light_id, 'on') and
+                             state_attr(target_light_id, 'brightness') | int(0)
+                               <= recovery_brightness_threshold | int }}
                     then:
-                      - service: scene.turn_on
+                      - service: light.turn_on
                         target:
-                          entity_id: "scene.{{ saved_scene_id }}"
+                          entity_id: !input target_light
+                        data:
+                          brightness: 255
+                      - delay: "00:00:02"
+                  # Restore the persisted snapshot, if we have one.
+                  - if:
+                      - condition: template
+                        value_template: "{{ has_store and saved.get('state') is not none }}"
+                    then:
+                      - choose:
+                          - conditions:
+                              - condition: template
+                                value_template: "{{ saved.get('state') == 'on' }}"
+                            sequence:
+                              - service: light.turn_on
+                                target:
+                                  entity_id: !input target_light
+                                data: "{{ restore_data }}"
+                          - conditions:
+                              - condition: template
+                                value_template: "{{ saved.get('state') == 'off' }}"
+                            sequence:
+                              - service: light.turn_off
+                                target:
+                                  entity_id: !input target_light
+                  - delay: "00:00:01"
                   - choose:
                       - conditions:
                           - condition: state
