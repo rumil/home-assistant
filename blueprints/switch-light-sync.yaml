@@ -230,7 +230,10 @@ action:
                         {{ ns.d | to_json }}
                   - service: input_text.set_value
                     target:
-                      entity_id: !input state_store
+                      # Templated (not !input) so an empty/unset store doesn't put an
+                      # invalid literal entity_id in the target at config-load validation.
+                      # Guarded by has_store, so it only runs with a real helper set.
+                      entity_id: "{{ state_store_id }}"
                     data:
                       value: "{{ snapshot_json | trim }}"
 
@@ -376,7 +379,10 @@ action:
                         {{ ns.d | to_json }}
                   - service: input_text.set_value
                     target:
-                      entity_id: !input state_store
+                      # Templated (not !input) so an empty/unset store doesn't put an
+                      # invalid literal entity_id in the target at config-load validation.
+                      # Guarded by has_store, so it only runs with a real helper set.
+                      entity_id: "{{ state_store_id }}"
                     data:
                       value: "{{ snapshot_json | trim }}"
 
