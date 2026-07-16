@@ -307,6 +307,12 @@ action:
                               - service: light.turn_off
                                 target:
                                   entity_id: !input target_light
+                  # Let the restore settle before reading state for Grenton sync.
+                  # Without this the restore's turn_on/turn_off is still in flight and
+                  # the sync below reads the pre-restore state, syncing Grenton to a
+                  # value the light is about to leave. The correcting light_changed
+                  # trigger is then dropped by mode:single and the desync sticks.
+                  - delay: "00:00:01"
                   - choose:
                       - conditions:
                           - condition: state
