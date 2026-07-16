@@ -109,6 +109,11 @@ variables:
     {{ ns.d }}
 
 mode: single
+# Dropping re-entrant triggers is the intended behaviour of mode:single here, so the
+# default WARNING-level "Already running" line is noise during any outage/restart burst.
+# Demoted to debug rather than silenced: the burst is still a real diagnostic signal for
+# a desync (see 836978b), so keep it retrievable by raising this automation's log level.
+max_exceeded: debug
 
 trigger:
   # User action from Grenton side (real state → real state, not a restart)

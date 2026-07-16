@@ -31,7 +31,7 @@ Hard constraints (do not rediscover the hard way):
 - `ha_get_history` on the light, the switch, **and** the instance's `input_text` store, `order="asc"`. The store's transitions show what each scenario decided to persist.
 - `ha_get_logs(source="logbook", compact=False)` on the switch/light — `context_user_id` distinguishes a **user action** from a **device report** (firmware boot: no context at all) from an **automation's own call** (`context_domain: automation`). The boot heuristic keys on exactly this, so it is the fastest way to confirm which path ran.
 - Timing is diagnostic: the gap from trigger to a scenario's first service call fingerprints the branch (e.g. B's boot path is `1s settle + turn_on + 2s` ⇒ its Grenton sync lands ~3.4 s after the trigger).
-- `ha_get_logs(source="system")` — a burst of `<name>: Already running` warnings means triggers are being dropped; cross-check against the desync window rather than assuming they are benign.
+- `ha_get_logs(source="system")` — a burst of `<name>: Already running` entries means triggers are being dropped; cross-check against the desync window rather than assuming they are benign. The blueprint sets `max_exceeded: debug`, so these **no longer appear at WARNING** — an outage or restart makes `mode: single` drop dozens of self-inflicted re-entrant triggers per instance, which is by design and drowned the log. To see them, raise the level first: `logger.set_level` on `homeassistant.components.automation.<object_id>` = `debug`, then read with `level="DEBUG"`.
 - Recorder/logbook timestamps come back in **local time** (Europe/Warsaw) while trace timestamps are **UTC** — do not compare them without converting.
 
 ## Blueprint architecture (`switch-light-sync.yaml`)
