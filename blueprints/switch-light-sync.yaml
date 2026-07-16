@@ -210,17 +210,28 @@ action:
             then:
               - wait_template: "{{ states(target_light_id) == states(grenton_switch_id) }}"
                 timeout: "00:00:03"
-              # Let brightness/colour attributes settle before snapshotting
+              # Wait for the brightness reading itself, not just a fixed settle — see the
+              # same wait in Scenario B for why 1 s is not enough on a Z2M group.
+              - wait_template: >-
+                  {{ not is_state(target_light_id, 'on') or
+                     state_attr(target_light_id, 'brightness') is not none }}
+                timeout: "00:00:03"
+              # Let the remaining colour attributes settle before snapshotting.
               - delay: "00:00:01"
-              # Never persist a device-reported low/boot brightness as the saved state.
+              # Never persist a device-reported low/boot brightness, or an on-state whose
+              # brightness we could not read, as the saved state. Unlike Scenario B there
+              # is no user test here: this branch reaches the light only via its own bare
+              # light.turn_on, so any level the light reports is the device's retained one
+              # and never a deliberate user setting. (The trigger's user_id describes who
+              # flipped the *switch*, which says nothing about the light's brightness.)
               - if:
                   - condition: template
                     value_template: >-
                       {{ states(target_light_id) in ['on', 'off'] and
                          not (is_state(target_light_id, 'on') and
-                              state_attr(target_light_id, 'brightness') | int(0)
-                                <= recovery_brightness_threshold | int and
-                              context.user_id is none) }}
+                              (state_attr(target_light_id, 'brightness') is none or
+                               state_attr(target_light_id, 'brightness') | int(0)
+                                 <= recovery_brightness_threshold | int)) }}
                 then:
                   - variables:
                       snapshot_json: >-
@@ -254,28 +265,51 @@ action:
               - "light_changed"
               - "light_low"
         sequence:
-          # Zigbee group entities report state "on" first; the brightness attribute
-          # arrives in a separate update ~500 ms later. Wait 1 s so that state_attr
-          # reads the settled brightness rather than the stale trigger snapshot.
+          # Two different problems, two steps — do not collapse them into one.
+          #
+          # The delay is the settle: a Zigbee group can report an intermediate brightness
+          # before its final one, so a light_low trigger that read immediately could judge
+          # the boot heuristic on a value the light is about to leave.
           - delay: "00:00:01"
+          # The wait covers late arrival: the group reports state "on" first and carries
+          # the brightness in a separate later update. The settle above is not long enough
+          # on its own — the gap was measured at 1.53 s on these groups, so brightness was
+          # still absent when the old code sampled it at 1 s. Passes straight through when
+          # the light is not on (an off light legitimately has no brightness).
+          - wait_template: >-
+              {{ not is_state(target_light_id, 'on') or
+                 state_attr(target_light_id, 'brightness') is not none }}
+            timeout: "00:00:03"
           - variables:
               cur_on: "{{ is_state(target_light_id, 'on') }}"
+              # An absent brightness means "unknown", not "zero" — HA reports every light
+              # attribute as none while the entity is off, and for a moment after it turns
+              # on. Coercing that to 0 made it satisfy any <= threshold test, so every
+              # turn-on looked like a 1 % boot. Track "known" separately and require it.
+              cur_bri_known: "{{ state_attr(target_light_id, 'brightness') is not none }}"
               cur_bri: "{{ state_attr(target_light_id, 'brightness') | int(0) }}"
               from_bri: >-
                 {{ (trigger.from_state.attributes.get('brightness', 0)
                     if trigger.from_state is not none else 0) | int(0) }}
               from_on: "{{ trigger.from_state is not none and trigger.from_state.state == 'on' }}"
-              # Firmware boot heuristic: the light is now on at/below the boot threshold, it
-              # just DROPPED into that low zone (a repeated low→low report is ignored so the
-              # device fighting back can't create a wake/restore loop), and no HA user
-              # initiated the change (device-reported, context.user_id is none).
+              # Firmware boot heuristic: the light is now on at a KNOWN brightness at/below
+              # the boot threshold, it just DROPPED into that low zone (a repeated low→low
+              # report is ignored so the device fighting back can't create a wake/restore
+              # loop), and no HA user initiated the change.
+              #
+              # The user test must read the triggering state's context, not `context`:
+              # HA builds an automation's own context as Context(parent_id=...) and never
+              # copies user_id into it, so `context.user_id` is unconditionally none here.
+              # As a guard against user actions it was dead, and a deliberate turn-on took
+              # this branch and got "restored" to the saved state.
               is_boot_recovery: >
                 {{ post_outage_behavior == 'restore_previous' and
                    recovery_brightness_threshold | int > 0 and
                    cur_on and
+                   cur_bri_known and
                    cur_bri <= recovery_brightness_threshold | int and
                    (not from_on or from_bri > recovery_brightness_threshold | int) and
-                   context.user_id is none }}
+                   trigger.to_state.context.user_id is none }}
           - choose:
               # Boot-recovery path: wake the device, restore the saved snapshot, sync Grenton
               - conditions:
@@ -367,15 +401,19 @@ action:
                         target:
                           entity_id: !input grenton_switch
               # Save the new state — but never persist a device-reported low/boot
-              # brightness (cur_on & low & no user context) as the saved snapshot.
+              # brightness as the saved snapshot. A low reading is only rejected when no
+              # user initiated it; a user who deliberately dims to 1 % gets that saved.
+              # An unknown brightness is rejected too: snapshotting an on-state whose
+              # level we could not read would silently drop the attribute.
               - if:
                   - condition: template
                     value_template: >-
                       {{ post_outage_behavior == 'restore_previous' and has_store and
                          states(target_light_id) in ['on', 'off'] and
                          not (cur_on and
-                              cur_bri <= recovery_brightness_threshold | int and
-                              context.user_id is none) }}
+                              (not cur_bri_known or
+                               (cur_bri <= recovery_brightness_threshold | int and
+                                trigger.to_state.context.user_id is none))) }}
                 then:
                   - variables:
                       snapshot_json: >-
@@ -404,11 +442,19 @@ action:
               - "grenton_recovered"
               - "ha_start"
         sequence:
+          # Wait for a brightness reading before testing it (see Scenario B). A no-op when
+          # the light is off or already reporting a level.
+          - wait_template: >-
+              {{ not is_state(target_light_id, 'on') or
+                 state_attr(target_light_id, 'brightness') is not none }}
+            timeout: "00:00:03"
           # On HA restart only: if the light is already on at ≤ threshold brightness it is in
           # firmware boot state (TS0502B and similar boot at 1%). Wake it up and restore the
           # saved snapshot before syncing Grenton, so the 0%-brightness stuck state is fixed
           # automatically without requiring a manual toggle. (If the light is still
           # unavailable at startup, the later light_recovered trigger handles it instead.)
+          # An unreadable brightness must not count as low — that would wake-and-restore a
+          # light that is legitimately on, turning it off whenever the snapshot says off.
           - if:
               - condition: template
                 value_template: >
@@ -416,6 +462,7 @@ action:
                      post_outage_behavior == 'restore_previous' and has_store and
                      recovery_brightness_threshold | int > 0 and
                      is_state(target_light_id, 'on') and
+                     state_attr(target_light_id, 'brightness') is not none and
                      state_attr(target_light_id, 'brightness') | int(0)
                        <= recovery_brightness_threshold | int }}
             then:
@@ -492,15 +539,24 @@ action:
                     then:
                       - wait_template: "{{ states(target_light_id) == 'on' }}"
                         timeout: "00:00:10"
+                  # The wait above only proves the state string flipped to 'on'; the
+                  # brightness arrives in a separate, later update. Wait for the reading
+                  # itself before testing it (see Scenario B).
+                  - wait_template: >-
+                      {{ not is_state(target_light_id, 'on') or
+                         state_attr(target_light_id, 'brightness') is not none }}
+                    timeout: "00:00:03"
                   # Whether the device recovered directly to 'on' at 1% or was just woken
                   # above, if it is on at ≤ threshold brightness it is in the stuck firmware
                   # boot state. Send a 100% wake-up to flush queued commands so the snapshot
-                  # restore below is actually accepted.
+                  # restore below is actually accepted. An unreadable brightness is not
+                  # treated as low — see Scenario C.
                   - if:
                       - condition: template
                         value_template: >
                           {{ recovery_brightness_threshold | int > 0 and
                              is_state(target_light_id, 'on') and
+                             state_attr(target_light_id, 'brightness') is not none and
                              state_attr(target_light_id, 'brightness') | int(0)
                                <= recovery_brightness_threshold | int }}
                     then:
