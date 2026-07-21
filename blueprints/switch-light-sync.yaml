@@ -7,9 +7,9 @@ blueprint:
     bidirectionally. Optionally restores a saved snapshot (configurable attributes)
     on power-outage recovery, persisted to an input_text helper so it survives a
     Home Assistant restart. For bulbs that drop out for one on-cycle after their
-    Zigbee link is re-established, the recovery path first "primes" the light at a
-    low brightness and re-drives it until it holds, so that fragile cycle is spent
-    automatically instead of ambushing the next turn-on.
+    Zigbee link is re-established, the recovery path first "primes" the light and
+    re-drives it until it holds, so that fragile cycle is spent automatically
+    instead of ambushing the next turn-on.
   domain: automation
   source_url: https://raw.githubusercontent.com/rumil/home-assistant/refs/heads/main/blueprints/switch-light-sync.yaml
   input:
@@ -98,10 +98,13 @@ blueprint:
         threshold is above 0. When the light returns from unavailable/unknown it is
         first driven to this brightness and held until it stops dropping out, to
         re-establish it on the mesh, and only then is the saved snapshot applied.
-        Keep it low so the priming flash is unobtrusive, but comfortably ABOVE the
-        recovery threshold or priming cannot be told apart from a firmware boot.
-        This value is transient and is never written to the saved snapshot.
-      default: 25
+        Must stay comfortably ABOVE the recovery threshold, or priming cannot be told
+        apart from a firmware boot. Defaults to full rather than something dim on
+        purpose: these bulbs retain the last level they were commanded to and light
+        up at it on a plain turn-on, so whatever you set here is also the level they
+        will "remember" after a recovery that ends with the light off. This value is
+        never written to the saved snapshot.
+      default: 255
       selector:
         number:
           min: 1
