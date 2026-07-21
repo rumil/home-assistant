@@ -504,36 +504,57 @@ action:
               # The bulb is established now, so apply the real target state. Unlike the
               # user-action path this MAY legitimately end in 'off': there is no user intent
               # here to override, only the state recorded before the outage.
-              - choose:
-                  - conditions:
-                      - condition: template
-                        value_template: "{{ has_store and saved.get('state') == 'on' }}"
-                    sequence:
-                      - service: light.turn_on
-                        target:
-                          entity_id: !input target_light
-                        data: "{{ restore_data }}"
-                  - conditions:
-                      - condition: template
-                        value_template: "{{ has_store and saved.get('state') == 'off' }}"
-                    sequence:
-                      - service: light.turn_off
-                        target:
-                          entity_id: !input target_light
-                default:
-                  - if:
-                      - condition: template
-                        value_template: "{{ recovered_state == 'on' }}"
-                    then:
-                      - service: light.turn_on
-                        target:
-                          entity_id: !input target_light
-                    else:
-                      - service: light.turn_off
-                        target:
-                          entity_id: !input target_light
-              # Settle before the sync below reads the state the restore just changed.
-              - delay: "00:00:01"
+              #
+              # Applying it once is not enough, and this is the subtle part. Priming only
+              # proves the bulb accepts an ON — the restore is a SEPARATE command and is
+              # just as fragile inside the same window. What actually happens is that the
+              # group members disagree: some take the turn_off while others stay on, and
+              # because Z2M computes a group as on when ANY member is on, the group flips
+              # back a few seconds later.
+              #
+              # So re-assert until the state holds, and keep running while we wait. Staying
+              # in the run is half the fix: it holds the mode:single slot, so the spurious
+              # flip's own light_changed is dropped instead of being taken for a user action
+              # and written to the store. Office flipped back on 3.7 s after a correct
+              # turn_off on 2026-07-21 — by then the run had ended, so Scenario B synced the
+              # switch on and poisoned the snapshot with {"state":"on"}.
+              - variables:
+                  target_state: >-
+                    {{ saved.get('state')
+                       if (has_store and saved.get('state') in ['on', 'off'])
+                       else recovered_state }}
+              - repeat:
+                  sequence:
+                    - choose:
+                        - conditions:
+                            - condition: template
+                              value_template: "{{ has_store and saved.get('state') == 'on' }}"
+                          sequence:
+                            - service: light.turn_on
+                              target:
+                                entity_id: !input target_light
+                              data: "{{ restore_data }}"
+                        - conditions:
+                            - condition: template
+                              value_template: "{{ target_state == 'on' }}"
+                          sequence:
+                            - service: light.turn_on
+                              target:
+                                entity_id: !input target_light
+                      default:
+                        - service: light.turn_off
+                          target:
+                            entity_id: !input target_light
+                    # Let the command land before judging whether it stuck.
+                    - delay: "00:00:01"
+                    # Watch for the state drifting off target. This times out — leaving
+                    # wait.completed false — when it holds, so a timeout is the success
+                    # signal and a completed wait means "it flipped, re-assert".
+                    - wait_template: "{{ states(target_light_id) != target_state }}"
+                      timeout: "00:00:04"
+                  until:
+                    - condition: template
+                      value_template: "{{ not wait.completed or repeat.index >= 3 }}"
           - choose:
               - conditions:
                   - condition: state
