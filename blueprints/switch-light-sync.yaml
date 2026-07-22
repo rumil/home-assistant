@@ -9,7 +9,9 @@ blueprint:
     Home Assistant restart. For bulbs that drop out for one on-cycle after their
     Zigbee link is re-established, the recovery path first "primes" the light and
     re-drives it until it holds, so that fragile cycle is spent automatically
-    instead of ambushing the next turn-on.
+    instead of ambushing the next turn-on. The same path also catches a "self-boot"
+    — a bulb that powers itself up at its firmware boot level with no user or
+    automation behind it — and restores the saved state instead of leaving it lit.
   domain: automation
   source_url: https://raw.githubusercontent.com/rumil/home-assistant/refs/heads/main/blueprints/switch-light-sync.yaml
   input:
@@ -28,8 +30,11 @@ blueprint:
     post_outage_behavior:
       name: Post-outage behavior
       description: >
-        What to do when the light recovers from an unavailable state (power outage).
-        "Light as source of truth" preserves the original backward-compatible behavior.
+        What to do when the light recovers from an unavailable state (power outage),
+        or comes back on its own at its firmware boot level. "Light as source of
+        truth" preserves the original backward-compatible behavior. "Restore previous
+        state" additionally requires a state store helper below; without one it falls
+        back to light-as-source-of-truth.
       default: light_source_of_truth
       selector:
         select:
@@ -38,10 +43,6 @@ blueprint:
               value: light_source_of_truth
             - label: "Restore previous state (saved snapshot)"
               value: restore_previous
-            - label: "Always turn on"
-              value: turn_on
-            - label: "Always turn off"
-              value: turn_off
     state_store:
       name: State store (input_text helper)
       description: >
@@ -81,10 +82,10 @@ blueprint:
       description: >
         Only relevant when "Restore previous state" is selected. If the light comes
         back on at a brightness at or below this value (0–255 scale), it is treated
-        as a firmware boot rather than a user action: the device is woken to a usable
-        level (to flush the stuck boot state). Use this for lights whose firmware
-        boots at 1 % (brightness ≈ 3). Set to 0 to disable both the boot heuristic
-        and recovery priming (rely only on unavailable-state detection).
+        as a firmware boot rather than a user action. Use this for lights whose
+        firmware boots at 1 % (brightness ≈ 3). Set to 0 to disable boot detection
+        and recovery priming entirely — the snapshot is still restored when the light
+        returns from unavailable, but a self-boot can no longer be recognised.
       default: 0
       selector:
         number:
@@ -95,15 +96,15 @@ blueprint:
       name: Recovery priming brightness
       description: >
         Only relevant when "Restore previous state" is selected and the recovery
-        threshold is above 0. When the light returns from unavailable/unknown it is
-        first driven to this brightness and held until it stops dropping out, to
-        re-establish it on the mesh, and only then is the saved snapshot applied.
-        Must stay comfortably ABOVE the recovery threshold, or priming cannot be told
-        apart from a firmware boot. Defaults to full rather than something dim on
-        purpose: these bulbs retain the last level they were commanded to and light
-        up at it on a plain turn-on, so whatever you set here is also the level they
-        will "remember" after a recovery that ends with the light off. This value is
-        never written to the saved snapshot.
+        threshold is above 0. Before the saved snapshot is applied, the light is
+        driven to this brightness and held until it stops dropping out, to
+        re-establish it on the mesh. It is also the level used to wake a bulb found
+        stuck at its boot level. Must stay comfortably ABOVE the recovery threshold,
+        or priming cannot be told apart from a firmware boot. Defaults to full rather
+        than something dim on purpose: these bulbs retain the last level they were
+        commanded to and light up at it on a plain turn-on, so whatever you set here
+        is also the level they will "remember" after a recovery that ends with the
+        light off. This value is never written to the saved snapshot.
       default: 255
       selector:
         number:
@@ -197,56 +198,78 @@ trigger:
 
 action:
   - choose:
-      # SCENARIO A: User action from Grenton → update light
+      # ─────────────────────────────────────────────────────────────────────────
+      # SCENARIO A: user action from the Grenton side → drive the light to match,
+      # then record the result.
+      #
+      # The switch is the target here, so this branch acts FIRST and settles after:
+      # putting the settle up front would add a visible lag to every wall-switch
+      # press. That is the only reason A does not share the light-side pipeline
+      # below; the assert loop and the save guard are deliberately identical to it
+      # and must be kept in lockstep.
+      # ─────────────────────────────────────────────────────────────────────────
       - conditions:
           - condition: trigger
             id: "grenton_changed"
         sequence:
-          - choose:
-              - conditions:
-                  - condition: state
-                    entity_id: !input grenton_switch
-                    state: "on"
-                  - condition: state
-                    entity_id: !input target_light
-                    state: "off"
-                sequence:
-                  - service: light.turn_on
-                    target:
-                      entity_id: !input target_light
-              - conditions:
-                  - condition: state
-                    entity_id: !input grenton_switch
-                    state: "off"
-                  - condition: state
-                    entity_id: !input target_light
-                    state: "on"
-                sequence:
-                  - service: light.turn_off
-                    target:
-                      entity_id: !input target_light
-          # Save snapshot after Grenton-driven light change
+          - variables:
+              target_state: "{{ states(grenton_switch_id) }}"
+          - if:
+              - condition: template
+                value_template: "{{ target_state in ['on', 'off'] }}"
+            then:
+              # Assert the switch's state onto the light and re-assert if it drifts.
+              # A Zigbee group can flip back seconds after a command lands when its
+              # members disagree (Z2M computes a group as on when ANY member is on),
+              # so a single command is not enough — see the light-side pipeline.
+              - repeat:
+                  sequence:
+                    - if:
+                        - condition: template
+                          value_template: "{{ states(target_light_id) != target_state }}"
+                      then:
+                        - choose:
+                            - conditions:
+                                - condition: template
+                                  value_template: "{{ target_state == 'on' }}"
+                              sequence:
+                                - service: light.turn_on
+                                  target:
+                                    entity_id: !input target_light
+                          default:
+                            - service: light.turn_off
+                              target:
+                                entity_id: !input target_light
+                    - delay: "00:00:01"
+                    # Watch for drift. This times out — leaving wait.completed false —
+                    # when the state holds, so a timeout is the success signal.
+                    - wait_template: "{{ states(target_light_id) != target_state }}"
+                      timeout: "00:00:04"
+                  until:
+                    - condition: template
+                      value_template: "{{ not wait.completed or repeat.index >= 3 }}"
+          # Save snapshot after the Grenton-driven light change
           # (the resulting light_changed trigger is dropped by mode: single)
           - if:
               - condition: template
                 value_template: "{{ post_outage_behavior == 'restore_previous' and has_store }}"
             then:
-              - wait_template: "{{ states(target_light_id) == states(grenton_switch_id) }}"
-                timeout: "00:00:03"
-              # Wait for the brightness reading itself, not just a fixed settle — see the
-              # same wait in Scenario B for why 1 s is not enough on a Z2M group.
+              # Wait for the brightness reading itself, not just a fixed settle — see
+              # the same wait in the light-side pipeline for why 1 s is not enough on
+              # a Z2M group.
               - wait_template: >-
                   {{ not is_state(target_light_id, 'on') or
                      state_attr(target_light_id, 'brightness') is not none }}
                 timeout: "00:00:03"
               # Let the remaining colour attributes settle before snapshotting.
               - delay: "00:00:01"
-              # Never persist a device-reported low/boot brightness, or an on-state whose
-              # brightness we could not read, as the saved state. Unlike Scenario B there
-              # is no user test here: this branch reaches the light only via its own bare
-              # light.turn_on, so any level the light reports is the device's retained one
-              # and never a deliberate user setting. (The trigger's user_id describes who
-              # flipped the *switch*, which says nothing about the light's brightness.)
+              # Never persist a device-reported low/boot brightness, or an on-state
+              # whose brightness we could not read. Unlike the light-side pipeline
+              # there is no user test here: this branch reaches the light only via its
+              # own bare light.turn_on, so any level the light reports is the device's
+              # retained one and never a deliberate user setting. (The trigger's
+              # user_id describes who flipped the *switch*, which says nothing about
+              # the light's brightness.)
               - if:
                   - condition: template
                     value_template: >-
@@ -276,431 +299,227 @@ action:
                     data:
                       value: "{{ snapshot_json | trim }}"
 
-      # SCENARIO B: Light changed (on/off) OR its brightness changed while staying on.
-      # Covers a real user action, a firmware boot that arrives as off→on, AND a firmware
-      # boot that drops the brightness to ~1% with no off/unavailable transition (an
-      # attribute-only change caught by the "light_low" brightness trigger). Both triggers
-      # can fire for one on/off event; the handler recomputes from current state so the
-      # outcome is identical whichever one wins under mode:single.
+      # ─────────────────────────────────────────────────────────────────────────
+      # LIGHT-SIDE PIPELINE: every event that arrives from the light, plus HA start.
+      #
+      # One pipeline, one branch point. Recovery, self-boot and ordinary user actions
+      # are the same physical situation seen at different moments; what differs is
+      # only which way the data flows:
+      #
+      #   intent == 'restore'  →  write the LIGHT from the STORE
+      #   intent == 'observe'  →  write the STORE from the LIGHT
+      #
+      # Everything after that decision — priming, asserting the target, syncing the
+      # switch — is shared, so the three cases cannot drift apart in behaviour.
+      #
+      # Why classification happens INSIDE the branch rather than in `conditions:`:
+      # the boot test needs a brightness reading, and on these Z2M groups the state
+      # string arrives ~1.5 s before the brightness attribute. A condition would read
+      # the value before it exists, which is exactly the trap the settle pair closes.
+      # ─────────────────────────────────────────────────────────────────────────
       - conditions:
           - condition: trigger
             id:
               - "light_changed"
               - "light_low"
+              - "light_recovered"
+              - "ha_start"
+          - condition: template
+            value_template: "{{ post_outage_behavior == 'restore_previous' and has_store }}"
         sequence:
+          # ── Settle ───────────────────────────────────────────────────────────
           # Two different problems, two steps — do not collapse them into one.
           #
-          # The delay is the settle: a Zigbee group can report an intermediate brightness
-          # before its final one, so a light_low trigger that read immediately could judge
-          # the boot heuristic on a value the light is about to leave.
+          # The delay is the settle: a Zigbee group can report an intermediate
+          # brightness before its final one, so a light_low trigger that read
+          # immediately could judge the boot test on a value the light is about to
+          # leave. It also gives the entity time to initialise on ha_start.
           - delay: "00:00:01"
-          # The wait covers late arrival: the group reports state "on" first and carries
-          # the brightness in a separate later update. The settle above is not long enough
-          # on its own — the gap was measured at 1.53 s on these groups, so brightness was
-          # still absent when the old code sampled it at 1 s. Passes straight through when
-          # the light is not on (an off light legitimately has no brightness).
+          # The wait covers late arrival: the group reports state "on" first and
+          # carries the brightness in a separate later update. The settle above is not
+          # long enough on its own — the gap was measured at 1.53 s on these groups.
+          # Passes straight through when the light is not on (an off light
+          # legitimately has no brightness).
           - wait_template: >-
               {{ not is_state(target_light_id, 'on') or
                  state_attr(target_light_id, 'brightness') is not none }}
             timeout: "00:00:03"
-          - variables:
-              cur_on: "{{ is_state(target_light_id, 'on') }}"
-              # An absent brightness means "unknown", not "zero" — HA reports every light
-              # attribute as none while the entity is off, and for a moment after it turns
-              # on. Coercing that to 0 made it satisfy any <= threshold test, so every
-              # turn-on looked like a 1 % boot. Track "known" separately and require it.
-              cur_bri_known: "{{ state_attr(target_light_id, 'brightness') is not none }}"
-              cur_bri: "{{ state_attr(target_light_id, 'brightness') | int(0) }}"
-              from_bri: >-
-                {{ (trigger.from_state.attributes.get('brightness', 0)
-                    if trigger.from_state is not none else 0) | int(0) }}
-              from_on: "{{ trigger.from_state is not none and trigger.from_state.state == 'on' }}"
-              # Firmware boot heuristic: the light is now on at a KNOWN brightness at/below
-              # the boot threshold, it just DROPPED into that low zone (a repeated low→low
-              # report is ignored so the device fighting back can't create a wake loop),
-              # and no HA user initiated the change (so a deliberate dim to 1 % is left
-              # alone).
-              #
-              # The user test must read the triggering state's context, not `context`:
-              # HA builds an automation's own context as Context(parent_id=...) and never
-              # copies user_id into it, so `context.user_id` is unconditionally none here.
-              # As a guard against user actions it was dead, and a deliberate turn-on took
-              # this branch and got "restored" to the saved state.
-              #
-              # This gate is deliberately weaker than it looks: a post-restart device report
-              # carries NO user context even when the user did initiate the turn-on, so it
-              # cannot be trusted to prove "no user intended this". That is why it now gates
-              # only a brightness wake and never an on/off change — see the note below.
-              needs_boot_wake: >
-                {{ post_outage_behavior == 'restore_previous' and
-                   recovery_brightness_threshold | int > 0 and
-                   cur_on and
-                   cur_bri_known and
-                   cur_bri <= recovery_brightness_threshold | int and
-                   (not from_on or from_bri > recovery_brightness_threshold | int) and
-                   trigger.to_state.context.user_id is none }}
-          # Wake a bulb that came up stuck at its 1 % firmware-boot level to a usable
-          # brightness — and nothing else.
-          #
-          # This path runs on USER actions, so it must never change on/off. It used to
-          # "restore the saved snapshot" here, which switched a light the user had just
-          # turned on back OFF whenever the snapshot held {"state":"off"}. The heuristic
-          # above cannot tell a user's turn-on from a spurious device boot, because a
-          # post-restart device report arrives with no user context at all — so deciding
-          # on/off here is unsafe by construction. The only sound reading of intent on this
-          # path is "the light is on, therefore leave it on": brightness may be corrected,
-          # on/off may not. Full restores (which may legitimately end in 'off') belong to
-          # the recovery path, where there is no user intent to override.
-          # (Stranded a deliberate turn-on 2026-07-20; fixed 2026-07-21.)
-          - if:
-              - condition: template
-                value_template: "{{ needs_boot_wake }}"
-            then:
-              # TS0502B (and similar) firmware queues commands while in the 1 % boot state
-              # but won't execute them until a turn_on wakes the device.
-              - choose:
-                  - conditions:
-                      - condition: template
-                        value_template: "{{ has_store and saved.get('state') == 'on' }}"
-                    sequence:
-                      - service: light.turn_on
-                        target:
-                          entity_id: !input target_light
-                        data: "{{ restore_data }}"
-                default:
-                  - service: light.turn_on
-                    target:
-                      entity_id: !input target_light
-                    data:
-                      brightness: 255
-              # Settle after the wake before the sync below reads what it just changed.
-              - delay: "00:00:01"
-          - choose:
-              - conditions:
-                  - condition: state
-                    entity_id: !input target_light
-                    state: "on"
-                  - condition: state
-                    entity_id: !input grenton_switch
-                    state: "off"
-                sequence:
-                  - service: switch.turn_on
-                    target:
-                      entity_id: !input grenton_switch
-              - conditions:
-                  - condition: state
-                    entity_id: !input target_light
-                    state: "off"
-                  - condition: state
-                    entity_id: !input grenton_switch
-                    state: "on"
-                sequence:
-                  - service: switch.turn_off
-                    target:
-                      entity_id: !input grenton_switch
-          # Save the new state — but never persist a device-reported low/boot brightness
-          # as the saved snapshot. A low reading is only rejected when no user initiated
-          # it; a user who deliberately dims to 1 % gets that saved. An unknown brightness
-          # is rejected too: snapshotting an on-state whose level we could not read would
-          # silently drop the attribute. The level is re-read here rather than reusing
-          # cur_bri because the wake above may have just corrected it, and the corrected
-          # value is the one worth saving.
-          - if:
-              - condition: template
-                value_template: >-
-                  {{ post_outage_behavior == 'restore_previous' and has_store and
-                     states(target_light_id) in ['on', 'off'] and
-                     not (is_state(target_light_id, 'on') and
-                          (state_attr(target_light_id, 'brightness') is none or
-                           (state_attr(target_light_id, 'brightness') | int(0)
-                              <= recovery_brightness_threshold | int and
-                            trigger.to_state.context.user_id is none))) }}
-            then:
-              - variables:
-                  snapshot_json: >-
-                    {% set st = states(target_light_id) %}
-                    {%- set ns = namespace(d={'state': st}) %}
-                    {%- if st == 'on' %}
-                    {%- for a in saved_attributes %}
-                    {%- set v = state_attr(target_light_id, a) %}
-                    {%- if v is not none %}{% set ns.d = dict(ns.d, **{a: v}) %}{% endif %}
-                    {%- endfor %}
-                    {%- endif %}
-                    {{ ns.d | to_json }}
-              - service: input_text.set_value
-                target:
-                  # Templated (not !input) so an empty/unset store doesn't put an
-                  # invalid literal entity_id in the target at config-load validation.
-                  # Guarded by has_store, so it only runs with a real helper set.
-                  entity_id: "{{ state_store_id }}"
-                data:
-                  value: "{{ snapshot_json | trim }}"
-
-      # SCENARIO C (RECOVERY PRIMING): the light returned from unavailable/unknown, or HA
-      # restarted. Only for restore_previous with the threshold enabled; everything else
-      # falls through to the legacy branches below.
-      #
-      # These bulbs are unreliable for exactly one on-cycle after their Zigbee link is
-      # re-established: the first turn_on lands, and ~3 s later every group member reports
-      # a spurious OFF — at FULL brightness, so this is not the 1 % boot state — collapsing
-      # the group back to off. A second turn_on always sticks. Crucially the fragility does
-      # not expire on its own: it survives for as long as the light stays off, so a recovery
-      # at 00:14 was still ambushing the first turn-on at 11:26 the next morning.
-      #
-      # So instead of leaving that doomed cycle for the user to walk into, spend it here:
-      # drive the bulb at a low priming level and re-drive until it stops dropping out, and
-      # only then apply the real target state. A mass recovery (Z2M/HA restart) brings every
-      # group back at once, so the priming is itself a burst — which is exactly the load
-      # that provokes the dropouts, and the retry loop is what absorbs it.
-      #
-      # The priming level is transient and must never reach the snapshot: nothing on this
-      # path calls input_text.set_value, and the re-entrant light_changed/light_low triggers
-      # the priming generates are dropped by mode:single while this run holds the slot. Keep
-      # it that way — a save here would persist the priming level as the "previous" state,
-      # and the next recovery would faithfully restore the light to it.
-      - conditions:
-          - condition: trigger
-            id:
-              - "light_recovered"
-              - "ha_start"
-          - condition: template
-            value_template: >-
-              {{ post_outage_behavior == 'restore_previous' and
-                 recovery_brightness_threshold | int > 0 }}
-        sequence:
-          # Let the entity settle after recovery before touching it. On ha_start the light
-          # may still be initialising — if it is not available yet this branch does nothing
-          # and the later light_recovered trigger runs it again for real.
-          - delay: "00:00:01"
           - if:
               - condition: template
                 value_template: "{{ states(target_light_id) in ['on', 'off'] }}"
             then:
-              # The state the light came back in. Used as the target only when no snapshot
-              # is available, so priming can never strand the light at the priming level.
+              # ── Classify ─────────────────────────────────────────────────────
               - variables:
-                  recovered_state: "{{ states(target_light_id) }}"
-              - repeat:
-                  sequence:
-                    - service: light.turn_on
-                      target:
-                        entity_id: !input target_light
-                      data:
-                        brightness: "{{ prime_brightness | int }}"
-                    # Let the command reach the device before judging the result.
-                    - delay: "00:00:01"
-                    # Watch for the spurious dropout: this goes true if the bulb falls back
-                    # to off OR sinks into the boot zone. If it holds instead, the wait
-                    # times out — so wait.completed is precisely the "it dropped" signal.
-                    - wait_template: >-
-                        {{ not is_state(target_light_id, 'on') or
-                           (state_attr(target_light_id, 'brightness') is not none and
-                            state_attr(target_light_id, 'brightness') | int(0)
-                              <= recovery_brightness_threshold | int) }}
-                      timeout: "00:00:04"
-                  until:
-                    - condition: template
-                      value_template: "{{ not wait.completed or repeat.index >= 3 }}"
-              # The bulb is established now, so apply the real target state. Unlike the
-              # user-action path this MAY legitimately end in 'off': there is no user intent
-              # here to override, only the state recorded before the outage.
-              #
-              # Applying it once is not enough, and this is the subtle part. Priming only
-              # proves the bulb accepts an ON — the restore is a SEPARATE command and is
-              # just as fragile inside the same window. What actually happens is that the
-              # group members disagree: some take the turn_off while others stay on, and
-              # because Z2M computes a group as on when ANY member is on, the group flips
-              # back a few seconds later.
-              #
-              # So re-assert until the state holds, and keep running while we wait. Staying
-              # in the run is half the fix: it holds the mode:single slot, so the spurious
-              # flip's own light_changed is dropped instead of being taken for a user action
-              # and written to the store. Office flipped back on 3.7 s after a correct
-              # turn_off on 2026-07-21 — by then the run had ended, so Scenario B synced the
-              # switch on and poisoned the snapshot with {"state":"on"}.
+                  cur_on: "{{ is_state(target_light_id, 'on') }}"
+                  # An absent brightness means "unknown", not "zero" — HA reports every
+                  # light attribute as none while the entity is off, and for a moment
+                  # after it turns on. Coercing that to 0 made it satisfy any
+                  # <= threshold test, so every turn-on looked like a 1 % boot. Track
+                  # "known" separately and require it.
+                  cur_bri_known: "{{ state_attr(target_light_id, 'brightness') is not none }}"
+                  cur_bri: "{{ state_attr(target_light_id, 'brightness') | int(0) }}"
+                  # trigger.from_state / to_state do not exist on the ha_start trigger.
+                  from_on: >-
+                    {{ trigger.from_state is defined and trigger.from_state is not none
+                       and trigger.from_state.state == 'on' }}
+                  from_bri: >-
+                    {{ (trigger.from_state.attributes.get('brightness', 0)
+                        if (trigger.from_state is defined and trigger.from_state is not none)
+                        else 0) | int(0) }}
+                  # Nothing in HA caused this state — neither a user nor an automation.
+                  #
+                  # user_id alone is not enough: a Grenton wall-switch press reaches the
+                  # light through Scenario A, whose service call leaves user_id null but
+                  # DOES stamp parent_id. Requiring both to be null is what separates a
+                  # device-originated report from every path HA itself can take.
+                  #
+                  # Do NOT use bare `context` here: HA builds an automation's own context
+                  # as Context(parent_id=...) and never copies user_id into it, so
+                  # `context.user_id is none` is unconditionally true and is dead code.
+                  device_originated: >-
+                    {{ trigger.to_state is defined and trigger.to_state is not none
+                       and trigger.to_state.context.user_id is none
+                       and trigger.to_state.context.parent_id is none }}
+                  # On at a KNOWN brightness at or below the boot threshold.
+                  at_boot_level: >-
+                    {{ recovery_brightness_threshold | int > 0 and cur_on and cur_bri_known
+                       and cur_bri <= recovery_brightness_threshold | int }}
+                  # ...and it just DROPPED into that zone. A repeated low→low report is
+                  # ignored so a device fighting back cannot create a wake loop.
+                  dropped_into_boot: >-
+                    {{ at_boot_level and
+                       (not from_on or from_bri > recovery_brightness_threshold | int) }}
+                  is_recovery: "{{ trigger.id in ['light_recovered', 'ha_start'] }}"
+                  # SELF-BOOT: the bulb powered itself up. It went off → on, came up at
+                  # the firmware boot level, and nothing in HA asked for it. The light
+                  # never went unavailable, so none of the recovery triggers fired — but
+                  # physically this is the same event, and it gets the same treatment.
+                  is_self_boot: >-
+                    {{ dropped_into_boot and not from_on and device_originated }}
+                  intent: "{{ 'restore' if (is_recovery or is_self_boot) else 'observe' }}"
+                  # A boot-level drop that is NOT a self-boot (the light was already on
+                  # and sank) still deserves its brightness corrected — but only its
+                  # brightness. On the observe path the light's own on/off state is the
+                  # user's intent and must never be overridden; deciding on/off from a
+                  # context-free device report is unsafe by construction, and doing it
+                  # here once switched off lights users had just turned on.
+                  needs_wake: >-
+                    {{ intent == 'observe' and dropped_into_boot and device_originated }}
+              # ── Target ───────────────────────────────────────────────────────
               - variables:
+                  # restore → the snapshot (which MAY legitimately be 'off'; there is no
+                  # user intent on this path to override). Falls back to the state the
+                  # light came back in, so priming can never strand it at the priming
+                  # level. observe → whatever the light itself says.
                   target_state: >-
                     {{ saved.get('state')
-                       if (has_store and saved.get('state') in ['on', 'off'])
-                       else recovered_state }}
-              - repeat:
-                  sequence:
-                    - choose:
-                        - conditions:
-                            - condition: template
-                              value_template: "{{ has_store and saved.get('state') == 'on' }}"
-                          sequence:
-                            - service: light.turn_on
-                              target:
-                                entity_id: !input target_light
-                              data: "{{ restore_data }}"
-                        - conditions:
-                            - condition: template
-                              value_template: "{{ target_state == 'on' }}"
-                          sequence:
-                            - service: light.turn_on
-                              target:
-                                entity_id: !input target_light
-                      default:
-                        - service: light.turn_off
+                       if (intent == 'restore' and saved.get('state') in ['on', 'off'])
+                       else states(target_light_id) }}
+                  # Attributes to send alongside an "on". Empty means a bare turn_on,
+                  # which also means the assert loop below stays silent while the state
+                  # already matches instead of re-commanding a light nobody touched.
+                  apply_data: >-
+                    {{ restore_data
+                       if (intent == 'restore' and saved.get('state') == 'on')
+                       else ({'brightness': prime_brightness | int} if needs_wake else {}) }}
+              # ── Prime ────────────────────────────────────────────────────────
+              # These bulbs are unreliable for exactly one on-cycle after their Zigbee
+              # link is re-established: the first turn_on lands, and ~3 s later every
+              # group member reports a spurious OFF — at FULL brightness, so this is not
+              # the 1 % boot state — collapsing the group back to off. A second turn_on
+              # sticks. The fragility does not expire on its own: it survives for as long
+              # as the light stays off, so a recovery at 00:14 was still ambushing the
+              # first turn-on at 11:26 the next morning. Spend that doomed cycle here.
+              #
+              # It matters even when the restore will end in 'off': these bulbs light up
+              # at the last level they were COMMANDED to, so priming is what leaves them
+              # with a usable remembered level for the next manual turn-on. Priming at
+              # 10 % once left every fixture coming on dim.
+              - if:
+                  - condition: template
+                    value_template: >-
+                      {{ intent == 'restore' and recovery_brightness_threshold | int > 0 }}
+                then:
+                  - repeat:
+                      sequence:
+                        - service: light.turn_on
                           target:
                             entity_id: !input target_light
-                    # Let the command land before judging whether it stuck.
-                    - delay: "00:00:01"
-                    # Watch for the state drifting off target. This times out — leaving
-                    # wait.completed false — when it holds, so a timeout is the success
-                    # signal and a completed wait means "it flipped, re-assert".
-                    - wait_template: "{{ states(target_light_id) != target_state }}"
-                      timeout: "00:00:04"
-                  until:
-                    - condition: template
-                      value_template: "{{ not wait.completed or repeat.index >= 3 }}"
-          - choose:
-              - conditions:
-                  - condition: state
-                    entity_id: !input target_light
-                    state: "on"
-                  - condition: state
-                    entity_id: !input grenton_switch
-                    state: "off"
-                sequence:
-                  - service: switch.turn_on
-                    target:
-                      entity_id: !input grenton_switch
-              - conditions:
-                  - condition: state
-                    entity_id: !input target_light
-                    state: "off"
-                  - condition: state
-                    entity_id: !input grenton_switch
-                    state: "on"
-                sequence:
-                  - service: switch.turn_off
-                    target:
-                      entity_id: !input grenton_switch
-
-      # SCENARIO D: Light recovered from unavailable (long outage — entity went fully unavailable)
-      - conditions:
-          - condition: trigger
-            id: "light_recovered"
-        sequence:
-          - choose:
-              - conditions:
+                          data:
+                            brightness: "{{ prime_brightness | int }}"
+                        # Let the command reach the device before judging the result.
+                        - delay: "00:00:01"
+                        # Watch for the spurious dropout: this goes true if the bulb
+                        # falls back to off OR sinks into the boot zone. If it holds
+                        # instead, the wait times out — so wait.completed is precisely
+                        # the "it dropped" signal.
+                        - wait_template: >-
+                            {{ not is_state(target_light_id, 'on') or
+                               (state_attr(target_light_id, 'brightness') is not none and
+                                state_attr(target_light_id, 'brightness') | int(0)
+                                  <= recovery_brightness_threshold | int) }}
+                          timeout: "00:00:04"
+                      until:
+                        - condition: template
+                          value_template: "{{ not wait.completed or repeat.index >= 3 }}"
+              # ── Assert ───────────────────────────────────────────────────────
+              # Applying the target once is not enough, and this is the subtle part.
+              # Priming only proves the bulb accepts an ON — the target is a SEPARATE
+              # command and just as fragile inside the same window. The group members
+              # disagree: some take the turn_off while others stay on, and because Z2M
+              # computes a group as on when ANY member is on, the group flips back a few
+              # seconds later. Office flipped back on 3.7 s after a correct turn_off on
+              # 2026-07-21.
+              #
+              # Staying inside the run is half the fix: it holds the mode:single slot, so
+              # the spurious flip's own light_changed is dropped instead of being taken
+              # for a user action, synced to the switch and written to the store.
+              #
+              # Entered only when there is something to assert. On an ordinary user
+              # action the light is already at the target and apply_data is empty, so
+              # the loop would command nothing yet still spend its full watch window
+              # holding the mode:single slot — delaying the switch sync below by
+              # several seconds on every single press. Skip it in that case; a state
+              # HA never commanded is not one this run put at risk.
+              - if:
                   - condition: template
-                    value_template: "{{ post_outage_behavior == 'restore_previous' }}"
-                sequence:
-                  # Let brightness settle after recovery before reading it (parity with
-                  # Scenario B), so a momentarily-missing brightness isn't misread as low.
-                  - delay: "00:00:01"
-                  # If it recovered as 'off' it may be mid-boot (e.g. TS0502B starts at 1%).
-                  # Hold mode:single while waiting so Scenario B's off→on trigger is blocked.
-                  - if:
-                      - condition: template
-                        value_template: "{{ trigger.to_state.state == 'off' }}"
-                    then:
-                      - wait_template: "{{ states(target_light_id) == 'on' }}"
-                        timeout: "00:00:10"
-                  # The wait above only proves the state string flipped to 'on'; the
-                  # brightness arrives in a separate, later update. Wait for the reading
-                  # itself before testing it (see Scenario B).
-                  - wait_template: >-
-                      {{ not is_state(target_light_id, 'on') or
-                         state_attr(target_light_id, 'brightness') is not none }}
-                    timeout: "00:00:03"
-                  # Whether the device recovered directly to 'on' at 1% or was just woken
-                  # above, if it is on at ≤ threshold brightness it is in the stuck firmware
-                  # boot state. Send a 100% wake-up to flush queued commands so the snapshot
-                  # restore below is actually accepted. An unreadable brightness is not
-                  # treated as low — see Scenario C.
-                  - if:
-                      - condition: template
-                        value_template: >
-                          {{ recovery_brightness_threshold | int > 0 and
-                             is_state(target_light_id, 'on') and
-                             state_attr(target_light_id, 'brightness') is not none and
-                             state_attr(target_light_id, 'brightness') | int(0)
-                               <= recovery_brightness_threshold | int }}
-                    then:
-                      - service: light.turn_on
-                        target:
-                          entity_id: !input target_light
-                        data:
-                          brightness: 255
-                      - delay: "00:00:02"
-                  # Restore the persisted snapshot, if we have one.
-                  - if:
-                      - condition: template
-                        value_template: "{{ has_store and saved.get('state') is not none }}"
-                    then:
-                      - choose:
-                          - conditions:
-                              - condition: template
-                                value_template: "{{ saved.get('state') == 'on' }}"
-                            sequence:
-                              - service: light.turn_on
-                                target:
-                                  entity_id: !input target_light
-                                data: "{{ restore_data }}"
-                          - conditions:
-                              - condition: template
-                                value_template: "{{ saved.get('state') == 'off' }}"
-                            sequence:
-                              - service: light.turn_off
-                                target:
-                                  entity_id: !input target_light
-                  - delay: "00:00:01"
-                  - choose:
-                      - conditions:
-                          - condition: state
-                            entity_id: !input target_light
-                            state: "on"
-                          - condition: state
-                            entity_id: !input grenton_switch
-                            state: "off"
-                        sequence:
-                          - service: switch.turn_on
-                            target:
-                              entity_id: !input grenton_switch
-                      - conditions:
-                          - condition: state
-                            entity_id: !input target_light
-                            state: "off"
-                          - condition: state
-                            entity_id: !input grenton_switch
-                            state: "on"
-                        sequence:
-                          - service: switch.turn_off
-                            target:
-                              entity_id: !input grenton_switch
-
-              - conditions:
-                  - condition: template
-                    value_template: "{{ post_outage_behavior == 'turn_on' }}"
-                sequence:
-                  - service: light.turn_on
-                    target:
-                      entity_id: !input target_light
-                  - wait_template: "{{ is_state(target_light_id, 'on') }}"
-                    timeout: "00:00:03"
-                  - service: switch.turn_on
-                    target:
-                      entity_id: !input grenton_switch
-
-              - conditions:
-                  - condition: template
-                    value_template: "{{ post_outage_behavior == 'turn_off' }}"
-                sequence:
-                  - service: light.turn_off
-                    target:
-                      entity_id: !input target_light
-                  - wait_template: "{{ is_state(target_light_id, 'off') }}"
-                    timeout: "00:00:03"
-                  - service: switch.turn_off
-                    target:
-                      entity_id: !input grenton_switch
-
-            # light_source_of_truth (default): trust what the light reports, sync Grenton
-            default:
+                    value_template: >-
+                      {{ intent == 'restore' or needs_wake or
+                         states(target_light_id) != target_state }}
+                then:
+                  - repeat:
+                      sequence:
+                        - if:
+                            - condition: template
+                              value_template: >-
+                                {{ states(target_light_id) != target_state or
+                                   apply_data | length > 0 }}
+                          then:
+                            - choose:
+                                - conditions:
+                                    - condition: template
+                                      value_template: "{{ target_state == 'on' }}"
+                                  sequence:
+                                    - service: light.turn_on
+                                      target:
+                                        entity_id: !input target_light
+                                      data: "{{ apply_data }}"
+                              default:
+                                - service: light.turn_off
+                                  target:
+                                    entity_id: !input target_light
+                        # Let the command land before judging whether it stuck.
+                        - delay: "00:00:01"
+                        # Watch for the state drifting off target. This times out —
+                        # leaving wait.completed false — when it holds, so a timeout is
+                        # the success signal and a completed wait means "it flipped,
+                        # re-assert".
+                        - wait_template: "{{ states(target_light_id) != target_state }}"
+                          timeout: "00:00:04"
+                      until:
+                        - condition: template
+                          value_template: "{{ not wait.completed or repeat.index >= 3 }}"
+              # ── Sync ─────────────────────────────────────────────────────────
               - choose:
                   - conditions:
                       - condition: state
@@ -724,20 +543,70 @@ action:
                       - service: switch.turn_off
                         target:
                           entity_id: !input grenton_switch
+              # ── Save ─────────────────────────────────────────────────────────
+              # ONLY on the observe path. A save on the restore path is how the store
+              # gets poisoned: the priming level would become the "previous" state and
+              # the next recovery would faithfully restore the light to it. A poisoned
+              # store is silent and self-perpetuating — it only shows up on the NEXT
+              # recovery, as the light being restored to the wrong state.
+              #
+              # A low reading is rejected only when nothing in HA initiated it; a user
+              # who deliberately dims to 1 % gets that saved. An unknown brightness is
+              # rejected too: snapshotting an on-state whose level we could not read
+              # would silently drop the attribute. The level is re-read here rather than
+              # reusing cur_bri because the wake above may have just corrected it, and
+              # the corrected value is the one worth saving.
+              - if:
+                  - condition: template
+                    value_template: >-
+                      {{ intent == 'observe' and
+                         states(target_light_id) in ['on', 'off'] and
+                         not (is_state(target_light_id, 'on') and
+                              (state_attr(target_light_id, 'brightness') is none or
+                               (state_attr(target_light_id, 'brightness') | int(0)
+                                  <= recovery_brightness_threshold | int and
+                                device_originated))) }}
+                then:
+                  - variables:
+                      snapshot_json: >-
+                        {% set st = states(target_light_id) %}
+                        {%- set ns = namespace(d={'state': st}) %}
+                        {%- if st == 'on' %}
+                        {%- for a in saved_attributes %}
+                        {%- set v = state_attr(target_light_id, a) %}
+                        {%- if v is not none %}{% set ns.d = dict(ns.d, **{a: v}) %}{% endif %}
+                        {%- endfor %}
+                        {%- endif %}
+                        {{ ns.d | to_json }}
+                  - service: input_text.set_value
+                    target:
+                      # Templated (not !input) so an empty/unset store doesn't put an
+                      # invalid literal entity_id in the target at config-load validation.
+                      # Guarded by has_store, so it only runs with a real helper set.
+                      entity_id: "{{ state_store_id }}"
+                    data:
+                      value: "{{ snapshot_json | trim }}"
 
-      # SCENARIO E: the Grenton switch recovered, or an HA restart that the priming branch
-      # did not claim (light_source_of_truth, or the threshold disabled). The light is the
-      # source of truth in both cases — sync the switch to it and touch nothing else.
-      # This branch must stay LAST: Scenario C takes the ha_start runs that need priming,
-      # and only what it leaves behind should land here.
+      # ─────────────────────────────────────────────────────────────────────────
+      # CATCH-ALL: the light is the source of truth — sync the switch to it and touch
+      # nothing else. Takes the Grenton switch's own recovery (handled nowhere else,
+      # and relevant to every instance), plus every light recovery and HA start the
+      # pipeline above did not claim: light_source_of_truth instances, and
+      # restore_previous instances with no state store configured.
+      #
+      # MUST STAY LAST — the pipeline above takes what it needs first, and only what
+      # it leaves behind should land here.
+      # ─────────────────────────────────────────────────────────────────────────
       - conditions:
           - condition: trigger
             id:
               - "grenton_recovered"
+              - "light_recovered"
               - "ha_start"
         sequence:
-          # Wait for a brightness reading before reading state (see Scenario B). A no-op
-          # when the light is off or already reporting a level.
+          # Settle, then wait for a brightness reading before reading state (see the
+          # pipeline above). A no-op when the light is off or already reporting a level.
+          - delay: "00:00:01"
           - wait_template: >-
               {{ not is_state(target_light_id, 'on') or
                  state_attr(target_light_id, 'brightness') is not none }}
