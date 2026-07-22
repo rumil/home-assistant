@@ -187,10 +187,20 @@ trigger:
   # Brightness changed while the light stayed "on" (no off/unavailable transition).
   # Catches a firmware boot that drops to ~1% and reports no state-string change, so
   # none of the state triggers above would fire.
+  #
+  # `for` debounces the turn-on ramp. Z2M publishes a turn-on as a sequence of
+  # brightness messages — 1 -> 252 -> 255 over ~10 s was measured on these groups on
+  # 2026-07-22 — and without this each step was its own run, so one turn-on produced
+  # four runs, most of them re-entrant noise that mode:single then had to drop.
+  # Intermediate values do not survive 3 s, so only the level the light settles at
+  # fires. Safe for what this trigger exists to catch: a genuine firmware boot sits
+  # at 1 % indefinitely, so it still fires, just 3 s later. light_changed is
+  # deliberately NOT debounced — the off/on sync must stay immediate.
   - platform: state
     entity_id: !input target_light
     attribute: brightness
     id: "light_low"
+    for: "00:00:03"
 
   - platform: homeassistant
     event: start
@@ -567,12 +577,22 @@ action:
               # store is silent and self-perpetuating — it only shows up on the NEXT
               # recovery, as the light being restored to the wrong state.
               #
-              # A low reading is rejected only when nothing in HA initiated it; a user
-              # who deliberately dims to 1 % gets that saved. An unknown brightness is
-              # rejected too: snapshotting an on-state whose level we could not read
-              # would silently drop the attribute. The level is re-read here rather than
-              # reusing cur_bri because the wake above may have just corrected it, and
-              # the corrected value is the one worth saving.
+              # A brightness at or below the threshold is persisted ONLY when it is a
+              # deliberate dim, which means both: a user (not the device) caused it,
+              # AND the light was already on. The second half is what makes the test
+              # honest — you cannot dim a light you just turned on, so a low reading on
+              # an off->on transition is always the turn-on ramp caught mid-flight, no
+              # matter who initiated it. Without `from_on` the "user dimmed it"
+              # carve-out swallowed the ramp and persisted brightness 1 (observed
+              # 2026-07-22, trace 43ec2e20: from_bri 1 -> cur_bri 252). Harmless while
+              # the next run overwrites it, but if a turn-on is the last event before
+              # an outage the store holds 1 and the next recovery restores the room to
+              # 1 %.
+              #
+              # An unknown brightness is rejected too: snapshotting an on-state whose
+              # level we could not read would silently drop the attribute. The level is
+              # re-read here rather than reusing cur_bri because the wake above may have
+              # just corrected it, and the corrected value is the one worth saving.
               - if:
                   - condition: template
                     value_template: >-
@@ -582,7 +602,7 @@ action:
                               (state_attr(target_light_id, 'brightness') is none or
                                (state_attr(target_light_id, 'brightness') | int(0)
                                   <= recovery_brightness_threshold | int and
-                                device_originated))) }}
+                                not (from_on and not device_originated)))) }}
                 then:
                   - variables:
                       snapshot_json: >-
