@@ -212,48 +212,49 @@ action:
           - condition: trigger
             id: "grenton_changed"
         sequence:
-          - variables:
-              target_state: "{{ states(grenton_switch_id) }}"
-          - if:
-              - condition: template
-                value_template: "{{ target_state in ['on', 'off'] }}"
-            then:
-              # Assert the switch's state onto the light and re-assert if it drifts.
-              # A Zigbee group can flip back seconds after a command lands when its
-              # members disagree (Z2M computes a group as on when ANY member is on),
-              # so a single command is not enough — see the light-side pipeline.
-              - repeat:
-                  sequence:
-                    - if:
-                        - condition: template
-                          value_template: "{{ states(target_light_id) != target_state }}"
-                      then:
-                        - choose:
-                            - conditions:
-                                - condition: template
-                                  value_template: "{{ target_state == 'on' }}"
-                              sequence:
-                                - service: light.turn_on
-                                  target:
-                                    entity_id: !input target_light
-                          default:
-                            - service: light.turn_off
-                              target:
-                                entity_id: !input target_light
-                    - delay: "00:00:01"
-                    # Watch for drift. This times out — leaving wait.completed false —
-                    # when the state holds, so a timeout is the success signal.
-                    - wait_template: "{{ states(target_light_id) != target_state }}"
-                      timeout: "00:00:04"
-                  until:
-                    - condition: template
-                      value_template: "{{ not wait.completed or repeat.index >= 3 }}"
+          # Single-shot, deliberately. A re-assert loop here is ACTIVELY HARMFUL and
+          # was removed after one live run on 2026-07-22 (27eb974): this branch fires
+          # on every Grenton change — including the one the pipeline below makes when
+          # it syncs the switch — so the loop left the automation sitting in a 4 s
+          # watch window after routine activity, holding the mode:single slot. A
+          # turn-on issued during that window looked exactly like a spurious device
+          # flip, so the loop "corrected" it by switching the light back off, while
+          # mode:single swallowed the user's own light_changed triggers.
+          #
+          # The light-side pipeline can afford a re-assert because it knows whether
+          # HA caused the change; this branch is driven by the switch and has no such
+          # signal for the light. See trace 0ce61722 for the failure in full.
+          - choose:
+              - conditions:
+                  - condition: state
+                    entity_id: !input grenton_switch
+                    state: "on"
+                  - condition: state
+                    entity_id: !input target_light
+                    state: "off"
+                sequence:
+                  - service: light.turn_on
+                    target:
+                      entity_id: !input target_light
+              - conditions:
+                  - condition: state
+                    entity_id: !input grenton_switch
+                    state: "off"
+                  - condition: state
+                    entity_id: !input target_light
+                    state: "on"
+                sequence:
+                  - service: light.turn_off
+                    target:
+                      entity_id: !input target_light
           # Save snapshot after the Grenton-driven light change
           # (the resulting light_changed trigger is dropped by mode: single)
           - if:
               - condition: template
                 value_template: "{{ post_outage_behavior == 'restore_previous' and has_store }}"
             then:
+              - wait_template: "{{ states(target_light_id) == states(grenton_switch_id) }}"
+                timeout: "00:00:03"
               # Wait for the brightness reading itself, not just a fixed settle — see
               # the same wait in the light-side pipeline for why 1 s is not enough on
               # a Z2M group.
@@ -518,7 +519,23 @@ action:
                           timeout: "00:00:04"
                       until:
                         - condition: template
-                          value_template: "{{ not wait.completed or repeat.index >= 3 }}"
+                          # Stop on a FOREIGN change. Re-asserting exists to fight
+                          # spurious device flips, never a deliberate command — a loop
+                          # that cannot tell them apart switches off lights the user
+                          # just turned on (Scenario A, 2026-07-22).
+                          #
+                          #   our own command  → the light carries THIS run's context id
+                          #                      (HA reuses it for the device's echo too)
+                          #   spurious flip    → fresh context, no user, no parent
+                          #   user action      → user_id set
+                          #   other automation → a parent that is not ours
+                          #
+                          # so only the first two are worth re-asserting against.
+                          value_template: >-
+                            {{ not wait.completed or repeat.index >= 3 or
+                               states[target_light_id].context.user_id is not none or
+                               (states[target_light_id].context.id != context.id and
+                                states[target_light_id].context.parent_id is not none) }}
               # ── Sync ─────────────────────────────────────────────────────────
               - choose:
                   - conditions:
