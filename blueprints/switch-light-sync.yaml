@@ -627,9 +627,19 @@ action:
       # ─────────────────────────────────────────────────────────────────────────
       # CATCH-ALL: the light is the source of truth — sync the switch to it and touch
       # nothing else. Takes the Grenton switch's own recovery (handled nowhere else,
-      # and relevant to every instance), plus every light recovery and HA start the
-      # pipeline above did not claim: light_source_of_truth instances, and
+      # and relevant to every instance), plus every light-side event the pipeline
+      # above did not claim: on light_source_of_truth instances, and on
       # restore_previous instances with no state store configured.
+      #
+      # `light_changed` is HERE, not only in the pipeline, on purpose: the pipeline is
+      # gated on `restore_previous and has_store`, so on a source-of-truth instance an
+      # ordinary light-side on/off would otherwise match no branch and never reach the
+      # switch. This is the ungated home for that sync — it restores the pre-27eb974
+      # Scenario B behaviour for those instances. `light_low` is deliberately NOT added:
+      # a boot-level brightness drop leaves on/off unchanged, so the sync below would be
+      # a no-op — brightness/priming is a restore_previous-only concern. On a
+      # restore_previous instance the pipeline claims `light_changed` first (first match
+      # wins), so this branch never sees it there.
       #
       # MUST STAY LAST — the pipeline above takes what it needs first, and only what
       # it leaves behind should land here.
@@ -638,6 +648,7 @@ action:
           - condition: trigger
             id:
               - "grenton_recovered"
+              - "light_changed"
               - "light_recovered"
               - "ha_start"
         sequence:
