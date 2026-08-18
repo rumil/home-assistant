@@ -222,18 +222,8 @@ action:
           - condition: trigger
             id: "grenton_changed"
         sequence:
-          # Single-shot, deliberately. A re-assert loop here is ACTIVELY HARMFUL and
-          # was removed after one live run on 2026-07-22 (27eb974): this branch fires
-          # on every Grenton change — including the one the pipeline below makes when
-          # it syncs the switch — so the loop left the automation sitting in a 4 s
-          # watch window after routine activity, holding the mode:single slot. A
-          # turn-on issued during that window looked exactly like a spurious device
-          # flip, so the loop "corrected" it by switching the light back off, while
-          # mode:single swallowed the user's own light_changed triggers.
-          #
-          # The light-side pipeline can afford a re-assert because it knows whether
-          # HA caused the change; this branch is driven by the switch and has no such
-          # signal for the light. See trace 0ce61722 for the failure in full.
+          # Drive the light to match the switch immediately — no settle up front, so
+          # a wall-switch press has no visible lag.
           - choose:
               - conditions:
                   - condition: state
@@ -257,6 +247,105 @@ action:
                   - service: light.turn_off
                     target:
                       entity_id: !input target_light
+          # Hold the light at the switch's state against the bulbs' spurious
+          # post-turn-on dropout — the same one-cycle firmware failure the recovery
+          # pipeline primes around, but seen here on a deliberate wall-switch turn-on,
+          # where nothing was re-driving the light and it collapsed back to off a few
+          # seconds later (the "blink then stays off" report, 2026-08-18).
+          #
+          # An earlier re-assert loop here WAS actively harmful and was removed on
+          # 2026-07-22 (27eb974, trace 0ce61722): it re-asserted a FROZEN target, so a
+          # real change arriving mid-watch got "corrected" away — switching a light
+          # back off that the user had just turned on. This loop is safe for two
+          # reasons that one lacked:
+          #   • it re-reads the LIVE switch every pass and drives the light to match
+          #     it, so a re-press is always honoured and the light is never stranded
+          #     disagreeing with the switch (the switch IS the user's intent here);
+          #   • it re-drives ONLY our own echo or a context-free device flip, never a
+          #     change carrying a user or another automation's parent — so it cannot
+          #     fight a deliberate action on the light. Same foreign-change test the
+          #     light-side assert loop uses.
+          # The initial drive above stays UNguarded so it always establishes our
+          # ownership first; the guard governs only the re-assert here. Note this does
+          # NOT rescue a link that is genuinely down (linkquality 0): a command that
+          # never reaches the bulb cannot be made to stick by resending it.
+          - repeat:
+              sequence:
+                - variables:
+                    # The bulb is on but sitting at its firmware boot level (~1%),
+                    # not a real level — a plain turn_on lights it there, which is the
+                    # "comes on dim" complaint. Only meaningful when boot detection is
+                    # enabled (threshold > 0); on a threshold-0 instance this is always
+                    # false and the loop only defends on/off.
+                    at_boot_now: >-
+                      {{ is_state(grenton_switch_id, 'on') and is_state(target_light_id, 'on')
+                         and state_attr(target_light_id, 'brightness') is not none
+                         and state_attr(target_light_id, 'brightness') | int(0)
+                             <= recovery_brightness_threshold | int }}
+                    # A change we must NOT fight: it carries a user, or another
+                    # automation's parent. (Our own echo reuses this run's context id;
+                    # a context-free device flip has neither — both are ours to correct.)
+                    foreign_now: >-
+                      {{ states[target_light_id].context.user_id is not none
+                         or (states[target_light_id].context.id != context.id
+                             and states[target_light_id].context.parent_id is not none) }}
+                    # Level to wake a boot-dim bulb to: the saved snapshot (so a wall
+                    # switch restores the level the room was last at, matching this
+                    # instance's restore-previous intent), else full. Never the boot
+                    # level itself — guaranteed by the threshold test — so waking can
+                    # never re-persist ~1%.
+                    wake_data: >-
+                      {{ restore_data
+                         if (restore_data.get('brightness') is not none
+                             and restore_data.get('brightness') | int(0)
+                                 > recovery_brightness_threshold | int)
+                         else {'brightness': prime_brightness | int} }}
+                # Re-drive when the light disagrees with the switch (it dropped out) OR
+                # it is on but stuck at the boot level — but never against a foreign
+                # change. Waking a boot-dim bulb sends the wake level; a plain on/off
+                # correction sends nothing extra, preserving a healthy remembered level.
+                - if:
+                    - condition: template
+                      value_template: >-
+                        {{ not foreign_now and
+                           (states(target_light_id) != states(grenton_switch_id) or at_boot_now) }}
+                  then:
+                    - choose:
+                        - conditions:
+                            - condition: template
+                              value_template: "{{ is_state(grenton_switch_id, 'on') }}"
+                          sequence:
+                            - service: light.turn_on
+                              target:
+                                entity_id: !input target_light
+                              data: "{{ wake_data if at_boot_now else {} }}"
+                      default:
+                        - service: light.turn_off
+                          target:
+                            entity_id: !input target_light
+                # Let the command land before judging whether it stuck.
+                - delay: "00:00:01"
+                # Stays true while anything is still wrong — the light disagrees with
+                # the switch (dropped out) OR it is on but still at the boot level — so
+                # the loop keeps going. Times out (false) only once it matches AND is at
+                # a real brightness, and that timeout is the "settled" signal.
+                - wait_template: >-
+                    {{ states(target_light_id) != states(grenton_switch_id)
+                       or (is_state(grenton_switch_id, 'on') and is_state(target_light_id, 'on')
+                           and state_attr(target_light_id, 'brightness') is not none
+                           and state_attr(target_light_id, 'brightness') | int(0)
+                               <= recovery_brightness_threshold | int) }}
+                  timeout: "00:00:04"
+              until:
+                - condition: template
+                  # Stop once it settles, after 3 tries, or on a FOREIGN change — a user
+                  # or another automation touching the light. Never re-assert against
+                  # those; see the light-side loop for the full reasoning.
+                  value_template: >-
+                    {{ not wait.completed or repeat.index >= 3
+                       or states[target_light_id].context.user_id is not none
+                       or (states[target_light_id].context.id != context.id
+                           and states[target_light_id].context.parent_id is not none) }}
           # Save snapshot after the Grenton-driven light change
           # (the resulting light_changed trigger is dropped by mode: single)
           - if:
