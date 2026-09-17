@@ -335,6 +335,101 @@ action:
                       value: "{{ snapshot_json | trim }}"
 
       # ─────────────────────────────────────────────────────────────────────────
+      # SPURIOUS FIRMWARE OFF: the light reported itself OFF with no one behind it
+      # while the Grenton switch — the user's standing intent — is still ON.
+      #
+      # These TS0502B bulbs do this after an Adaptive Lighting adapt with a
+      # transition: minutes after the last turn-on, ~all group members report OFF at
+      # FULL brightness (not the 1 % boot level) with no HA command behind it — a
+      # firmware bug (Z2M #13148), diagnosed here 2026-09-17. It is device-originated
+      # (no user_id, no parent_id), which is exactly what separates it from every real
+      # off: a Grenton wall press reaches the light through Scenario A and stamps
+      # parent_id; an HA-app off stamps user_id.
+      #
+      # Left to the pipeline/catch-all this off is taken for the light's own state:
+      # the switch is synced OFF and (on a restore_previous instance) the store is
+      # poisoned to {"state":"off"}, so the light stays dark AND the next recovery
+      # restores it dark. Instead, re-drive the light to the LIVE switch until it
+      # holds, and do NOT sync the switch off or save. Placed BEFORE the pipeline and
+      # the catch-all and gated only on trigger/context/switch (no brightness, so no
+      # settle is needed to classify) — it applies to every instance, because the bug
+      # is universal to these bulbs and the fix needs no store: it drives to the
+      # switch. A normal off still falls through to the branches below, because it
+      # carries a user_id or a parent_id and fails the device-originated test here.
+      #
+      # This is safe where the 2026-07-22 re-assert loop was not, for the same two
+      # reasons Scenario A's defend loop was (see the foreign-change table in
+      # CLAUDE.md): each pass re-reads the LIVE switch and drives the light to it — so
+      # a user re-press is honoured even when its grenton_changed is dropped by
+      # mode:single while this run holds the slot, because the switch STATE still
+      # updates and is re-read — and it stops on a foreign change (a user_id, or
+      # another automation's parent, on the light). It does NOT bring back the
+      # dropped-re-press cost of the old Scenario A defend loop, which is why that loop
+      # could be removed and this one is acceptable: unlike it, this branch engages
+      # ONLY on an actual device-originated off, never on an ordinary press, so normal
+      # on/off traffic never holds the slot. Per pass it settles 1 s and does not sit
+      # in a long drift-watch. The turn_on is bare (no attributes), so like Scenario A
+      # it never trips Adaptive Lighting and owes no AL release.
+      # ─────────────────────────────────────────────────────────────────────────
+      - conditions:
+          - condition: trigger
+            id: "light_changed"
+          - condition: template
+            value_template: >-
+              {{ trigger.to_state is defined and trigger.to_state is not none
+                 and trigger.to_state.state == 'off'
+                 and trigger.to_state.context.user_id is none
+                 and trigger.to_state.context.parent_id is none
+                 and is_state(grenton_switch_id, 'on') }}
+        sequence:
+          - repeat:
+              sequence:
+                # Drive the light to the live switch. Only real on/off, never an
+                # 'unavailable' blip on the switch (a Grenton restart), so a transient
+                # switch dropout can never turn the light off. Bare turn_on: no
+                # attributes, so Adaptive Lighting is not tripped (as in Scenario A).
+                - choose:
+                    - conditions:
+                        - condition: template
+                          value_template: >-
+                            {{ is_state(grenton_switch_id, 'on')
+                               and not is_state(target_light_id, 'on') }}
+                      sequence:
+                        - service: light.turn_on
+                          target:
+                            entity_id: !input target_light
+                    - conditions:
+                        - condition: template
+                          value_template: >-
+                            {{ is_state(grenton_switch_id, 'off')
+                               and not is_state(target_light_id, 'off') }}
+                      sequence:
+                        - service: light.turn_off
+                          target:
+                            entity_id: !input target_light
+                # 1 s settle only — no long drift-watch, so the mode:single slot is not
+                # held in a multi-second window. A press landing mid-run is not lost:
+                # the switch STATE updates even when its trigger is dropped, and the
+                # next pass re-reads it and drives the light to it. A second firmware
+                # drop ~3 s later lands after this run frees the slot, re-fires
+                # light_changed and re-enters here — self-healing across runs, paced by
+                # the firmware, which drops for one cycle before the ON sticks.
+                - delay: "00:00:01"
+              until:
+                - condition: template
+                  # Stop when the light has converged on the live switch, after 3
+                  # tries, or on a FOREIGN change — the same discriminator the assert
+                  # loop uses: a user_id on the light, or another automation's parent
+                  # (not this run's echo). Our own re-drive echoes carry this run's
+                  # context.id and do not stop the loop.
+                  value_template: >-
+                    {{ states(target_light_id) == states(grenton_switch_id)
+                       or repeat.index >= 3
+                       or states[target_light_id].context.user_id is not none
+                       or (states[target_light_id].context.id != context.id and
+                           states[target_light_id].context.parent_id is not none) }}
+
+      # ─────────────────────────────────────────────────────────────────────────
       # LIGHT-SIDE PIPELINE: every event that arrives from the light, plus HA start.
       #
       # One pipeline, one branch point. Recovery, self-boot and ordinary user actions
@@ -351,6 +446,10 @@ action:
       # the boot test needs a brightness reading, and on these Z2M groups the state
       # string arrives ~1.5 s before the brightness attribute. A condition would read
       # the value before it exists, which is exactly the trap the settle pair closes.
+      #
+      # A device-originated `light_changed` to OFF while the switch is ON is claimed by
+      # the spurious-firmware-off branch above (first match wins) and never reaches
+      # here; every other light_changed does.
       # ─────────────────────────────────────────────────────────────────────────
       - conditions:
           - condition: trigger
@@ -704,7 +803,9 @@ action:
       # a boot-level brightness drop leaves on/off unchanged, so the sync below would be
       # a no-op — brightness/priming is a restore_previous-only concern. On a
       # restore_previous instance the pipeline claims `light_changed` first (first match
-      # wins), so this branch never sees it there.
+      # wins), so this branch never sees it there. A device-originated off while the
+      # switch is on is also claimed earlier, by the spurious-firmware-off branch, so a
+      # source-of-truth instance no longer syncs its switch off on that firmware glitch.
       #
       # MUST STAY LAST — the pipeline above takes what it needs first, and only what
       # it leaves behind should land here.
