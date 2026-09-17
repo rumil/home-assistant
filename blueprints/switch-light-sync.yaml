@@ -111,6 +111,25 @@ blueprint:
           min: 1
           max: 255
           step: 1
+    adaptive_lighting_switch:
+      name: Adaptive Lighting switch (optional)
+      description: >
+        Optional. If this light is governed by an Adaptive Lighting (AL) instance,
+        select that instance's main switch here (e.g. switch.adaptive_lighting_main).
+        On a recovery, self-boot or brightness-wake the blueprint drives the light with
+        explicit brightness/colour (priming and the snapshot restore). With
+        take_over_control enabled, AL latches any such attributed turn_on as a manual
+        override and stops adapting the light until it is turned off and on again — so
+        a light left on after an outage stays frozen at the recovery values for hours.
+        When this switch is set, the blueprint clears AL's manual-control flag for this
+        light at the end of the recovery path, handing colour/brightness back to AL.
+        The plain on/off sync (Scenario A) sends no attributes and never trips AL, so it
+        is unaffected. Leave empty if the light is not under AL.
+      default: ""
+      selector:
+        entity:
+          domain: switch
+          integration: adaptive_lighting
 
 variables:
   target_light_id: !input target_light
@@ -120,8 +139,13 @@ variables:
   prime_brightness: !input prime_brightness
   state_store_id: !input state_store
   saved_attributes: !input saved_attributes
+  adaptive_lighting_switch_id: !input adaptive_lighting_switch
   # Whether a persistent state store is configured.
   has_store: "{{ state_store_id not in ['', 'unknown', 'unavailable', none] }}"
+  # Whether an Adaptive Lighting switch is configured for this light. When true, the
+  # recovery path hands colour/brightness back to AL after it finishes (see the branch
+  # end), so AL does not latch our attributed turn_ons as a manual override.
+  has_al: "{{ adaptive_lighting_switch_id not in ['', 'unknown', 'unavailable', none] }}"
   # The saved snapshot (parsed from the store), read once at run start. Empty dict
   # when no store is configured or the store holds no valid JSON yet.
   saved: >-
@@ -623,6 +647,47 @@ action:
                       entity_id: "{{ state_store_id }}"
                     data:
                       value: "{{ snapshot_json | trim }}"
+              # ── Hand back to Adaptive Lighting ───────────────────────────────
+              # Only when an AL switch is configured for this light. Every attributed
+              # turn_on this branch issued — the prime loop, the restore snapshot, the
+              # needs_wake brightness — is seen by AL (with take_over_control on) as a
+              # manual override, so AL stops adapting the light until it is next turned
+              # off and on. On a light left on after an outage that means it sits frozen
+              # at the recovery colour/brightness for hours. Clearing manual_control here
+              # tells AL "that was not a human" and returns the light to the curve.
+              #
+              # LAST, after the save on purpose: needs_wake is intent=='observe', so the
+              # save above runs on that path too, and clearing AL before it would let AL
+              # start re-adapting and the save could snapshot a mid-adapt value. Read the
+              # state, persist it, THEN release AL.
+              #
+              # Guarded on is_state('on'): a restore that ends 'off' sent no attributes
+              # (apply_data is empty, bare turn_off), so there is nothing for AL to have
+              # latched. Only the restore and needs_wake paths attribute the light;
+              # ordinary observe on/off does not, hence the intent test rather than
+              # clearing unconditionally.
+              #
+              # entity_id targets the AL switch; `lights` scopes the clear to this one
+              # light so sibling lights on the same AL instance keep any genuine manual
+              # override. set_manual_control:false re-adapts immediately in current AL;
+              # if a future version defers it to the next cycle, follow with
+              # adaptive_lighting.apply.
+              - if:
+                  - condition: template
+                    value_template: >-
+                      {{ has_al and (intent == 'restore' or needs_wake)
+                         and is_state(target_light_id, 'on') }}
+                then:
+                  - delay: "00:00:01"
+                  - service: adaptive_lighting.set_manual_control
+                    target:
+                      # Templated (not !input) so an empty/unset switch doesn't put an
+                      # invalid literal entity_id in the target at config-load validation.
+                      # Guarded by has_al, so it only runs with a real AL switch set.
+                      entity_id: "{{ adaptive_lighting_switch_id }}"
+                    data:
+                      lights: ["{{ target_light_id }}"]
+                      manual_control: false
 
       # ─────────────────────────────────────────────────────────────────────────
       # CATCH-ALL: the light is the source of truth — sync the switch to it and touch
