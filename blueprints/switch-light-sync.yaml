@@ -13,7 +13,8 @@ blueprint:
     — a bulb that powers itself up at its firmware boot level with no user or
     automation behind it — and restores the saved state instead of leaving it lit.
     A light that switches itself OFF while the switch is still ON (a known firmware
-    fault) is re-driven to the switch instead of being synced off — including when
+    fault) is re-driven to the switch with no transition, so it returns immediately,
+    instead of being synced off — including when
     the off lands within HA's ~5 s context window after an Adaptive Lighting
     command and so inherits AL's context: AL never turns a light off, so an off in
     its context is always the device's own doing, never a decision.
@@ -408,8 +409,13 @@ action:
       # could be removed and this one is acceptable: unlike it, this branch engages
       # ONLY on an actual device-originated off, never on an ordinary press, so normal
       # on/off traffic never holds the slot. Per pass it settles 1 s and does not sit
-      # in a long drift-watch. The turn_on is bare (no attributes), so like Scenario A
-      # it never trips Adaptive Lighting and owes no AL release.
+      # in a long drift-watch. The turn_on carries no brightness or colour, so like
+      # Scenario A it never trips Adaptive Lighting and owes no AL release. It does
+      # carry `transition: 0`: AL's intercept keeps a caller-supplied transition in
+      # place of its `initial_transition` (1 s here), so the light snaps back instead
+      # of ramping up over a second — while ordinary turn-ons keep AL's soft ramp.
+      # AL counts only brightness/colour/effect as manual control (see
+      # get_light_control_attributes), so transition alone does not latch it.
       # ─────────────────────────────────────────────────────────────────────────
       - conditions:
           - condition: trigger
@@ -424,8 +430,9 @@ action:
               sequence:
                 # Drive the light to the live switch. Only real on/off, never an
                 # 'unavailable' blip on the switch (a Grenton restart), so a transient
-                # switch dropout can never turn the light off. Bare turn_on: no
-                # attributes, so Adaptive Lighting is not tripped (as in Scenario A).
+                # switch dropout can never turn the light off. No brightness or
+                # colour, so Adaptive Lighting is not tripped (as in Scenario A);
+                # transition 0 only, so the recovery is instant (see above).
                 - choose:
                     - conditions:
                         - condition: template
@@ -436,6 +443,8 @@ action:
                         - service: light.turn_on
                           target:
                             entity_id: !input target_light
+                          data:
+                            transition: 0
                     - conditions:
                         - condition: template
                           value_template: >-
