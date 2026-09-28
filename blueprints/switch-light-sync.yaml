@@ -12,6 +12,11 @@ blueprint:
     instead of ambushing the next turn-on. The same path also catches a "self-boot"
     — a bulb that powers itself up at its firmware boot level with no user or
     automation behind it — and restores the saved state instead of leaving it lit.
+    A light that switches itself OFF while the switch is still ON (a known firmware
+    fault) is re-driven to the switch instead of being synced off — including when
+    the off lands within HA's ~5 s context window after an Adaptive Lighting
+    command and so inherits AL's context: AL never turns a light off, so an off in
+    its context is always the device's own doing, never a decision.
   domain: automation
   source_url: https://raw.githubusercontent.com/rumil/home-assistant/refs/heads/main/blueprints/switch-light-sync.yaml
   input:
@@ -146,6 +151,37 @@ variables:
   # recovery path hands colour/brightness back to AL after it finishes (see the branch
   # end), so AL does not latch our attributed turn_ons as a manual override.
   has_al: "{{ adaptive_lighting_switch_id not in ['', 'unknown', 'unavailable', none] }}"
+  # Adaptive Lighting stamps every context it creates as
+  # "<10-char ULID time>:al:<name hash>:<which>:<index>" (create_context in
+  # custom_components/adaptive_lighting/switch.py; its own is_our_context_id tests for
+  # exactly this substring). The marker is in the context's ID; its parent_id is
+  # whoever called AL (an automation, a user) and carries no marker.
+  al_context_marker: ":al:"
+  # THE definition of an UNINTENTIONAL change: nothing in HA decided it. Used by the
+  # spurious-firmware-off branch, the pipeline's device_originated, and — applied to
+  # the live state instead of the trigger — the foreign-change test in both repeat
+  # loops. Keep those inline copies in lockstep with this one.
+  #
+  #   no user_id AND no parent_id  → a pure device report.
+  #   no user_id AND an OFF whose context ID is AL's → also the device. HA attributes
+  #     any state write within ~5 s of a service call to that call's context, so a
+  #     firmware self-off landing right after an AL adapt inherits AL's context (with
+  #     the calling automation as parent_id). AL never turns a light off, so an off in
+  #     its context is never AL's decision. Diagnosed 2026-09-28 (hall_track, trace
+  #     ab9beeee): the grace-period automation cleared manual_control, AL adapted, the
+  #     TS0502B group dropped off 1 s later, and with parent_id set the off was taken
+  #     for intentional — the switch was synced off and the store saved {"state":"off"}.
+  #
+  # Deliberately limited to OFF: after every turn-on AL adapts in a context whose
+  # parent is the turn-on's own (the user's) context, so an ON in AL's context is
+  # routinely the tail of a deliberate action. Counting those as unintentional would
+  # let needs_wake fight AL's night-time brightness.
+  unintentional_change: >-
+    {{ trigger.to_state is defined and trigger.to_state is not none
+       and trigger.to_state.context.user_id is none
+       and (trigger.to_state.context.parent_id is none
+            or (trigger.to_state.state == 'off'
+                and al_context_marker in trigger.to_state.context.id)) }}
   # The saved snapshot (parsed from the store), read once at run start. Empty dict
   # when no store is configured or the store holds no valid JSON yet.
   saved: >-
@@ -341,10 +377,14 @@ action:
       # These TS0502B bulbs do this after an Adaptive Lighting adapt with a
       # transition: minutes after the last turn-on, ~all group members report OFF at
       # FULL brightness (not the 1 % boot level) with no HA command behind it — a
-      # firmware bug (Z2M #13148), diagnosed here 2026-09-17. It is device-originated
-      # (no user_id, no parent_id), which is exactly what separates it from every real
-      # off: a Grenton wall press reaches the light through Scenario A and stamps
-      # parent_id; an HA-app off stamps user_id.
+      # firmware bug (Z2M #13148), diagnosed here 2026-09-17. It is unintentional (see
+      # `unintentional_change`: no user_id, and no parent_id or an AL context ID),
+      # which is exactly what separates it from every real off: a Grenton wall press
+      # reaches the light through Scenario A and stamps parent_id; an HA-app off stamps
+      # user_id; another automation's off stamps its own context as parent. When the
+      # drop lands within ~5 s of an AL command it inherits AL's context instead of a
+      # fresh one — that case reached the pipeline until 2026-09-28 and was persisted
+      # as the light's real state.
       #
       # Left to the pipeline/catch-all this off is taken for the light's own state:
       # the switch is synced OFF and (on a restore_previous instance) the store is
@@ -355,7 +395,7 @@ action:
       # settle is needed to classify) — it applies to every instance, because the bug
       # is universal to these bulbs and the fix needs no store: it drives to the
       # switch. A normal off still falls through to the branches below, because it
-      # carries a user_id or a parent_id and fails the device-originated test here.
+      # carries a user_id or a non-AL parent_id and fails the unintentional test here.
       #
       # This is safe where the 2026-07-22 re-assert loop was not, for the same two
       # reasons Scenario A's defend loop was (see the foreign-change table in
@@ -376,10 +416,8 @@ action:
             id: "light_changed"
           - condition: template
             value_template: >-
-              {{ trigger.to_state is defined and trigger.to_state is not none
+              {{ unintentional_change
                  and trigger.to_state.state == 'off'
-                 and trigger.to_state.context.user_id is none
-                 and trigger.to_state.context.parent_id is none
                  and is_state(grenton_switch_id, 'on') }}
         sequence:
           - repeat:
@@ -419,15 +457,20 @@ action:
                 - condition: template
                   # Stop when the light has converged on the live switch, after 3
                   # tries, or on a FOREIGN change — the same discriminator the assert
-                  # loop uses: a user_id on the light, or another automation's parent
-                  # (not this run's echo). Our own re-drive echoes carry this run's
-                  # context.id and do not stop the loop.
+                  # loop uses: a change that is neither this run's own echo (our
+                  # re-drives carry this run's context.id) nor unintentional per
+                  # `unintentional_change`, applied here to the live state. So a
+                  # repeat self-off in AL's context — AL re-adapting after our re-drive
+                  # — is re-driven rather than taken for a decision.
                   value_template: >-
+                    {% set c = states[target_light_id].context %}
                     {{ states(target_light_id) == states(grenton_switch_id)
                        or repeat.index >= 3
-                       or states[target_light_id].context.user_id is not none
-                       or (states[target_light_id].context.id != context.id and
-                           states[target_light_id].context.parent_id is not none) }}
+                       or (c.id != context.id and
+                           not (c.user_id is none and
+                                (c.parent_id is none or
+                                 (is_state(target_light_id, 'off') and
+                                  al_context_marker in c.id)))) }}
 
       # ─────────────────────────────────────────────────────────────────────────
       # LIGHT-SIDE PIPELINE: every event that arrives from the light, plus HA start.
@@ -500,20 +543,22 @@ action:
                     {{ (trigger.from_state.attributes.get('brightness', 0)
                         if (trigger.from_state is defined and trigger.from_state is not none)
                         else 0) | int(0) }}
-                  # Nothing in HA caused this state — neither a user nor an automation.
+                  # Nothing in HA decided this state — neither a user nor an automation.
+                  # One definition, shared with the spurious-off branch and the repeat
+                  # loops: see `unintentional_change` at the top.
                   #
                   # user_id alone is not enough: a Grenton wall-switch press reaches the
                   # light through Scenario A, whose service call leaves user_id null but
-                  # DOES stamp parent_id. Requiring both to be null is what separates a
-                  # device-originated report from every path HA itself can take.
+                  # DOES stamp parent_id. Requiring no parent (or, for an off, AL's
+                  # context) is what separates a device-originated report from every
+                  # path HA itself can take.
                   #
                   # Do NOT use bare `context` here: HA builds an automation's own context
-                  # as Context(parent_id=...) and never copies user_id into it, so
-                  # `context.user_id is none` is unconditionally true and is dead code.
-                  device_originated: >-
-                    {{ trigger.to_state is defined and trigger.to_state is not none
-                       and trigger.to_state.context.user_id is none
-                       and trigger.to_state.context.parent_id is none }}
+                  # as Context(parent_id=<trigger context id>) and never copies user_id
+                  # into it, so `context.user_id is none` is unconditionally true and is
+                  # dead code. The same construction is why a trace's `context.parent_id`
+                  # shows the TRIGGERING state's context ID, not that state's parent.
+                  device_originated: "{{ unintentional_change }}"
                   # On at a KNOWN brightness at or below the boot threshold.
                   at_boot_level: >-
                     {{ recovery_brightness_threshold | int > 0 and cur_on and cur_bri_known
@@ -659,16 +704,22 @@ action:
                           #
                           #   our own command  → the light carries THIS run's context id
                           #                      (HA reuses it for the device's echo too)
-                          #   spurious flip    → fresh context, no user, no parent
+                          #   spurious flip    → fresh context, no user, no parent — or
+                          #                      an OFF inheriting an AL command's context
                           #   user action      → user_id set
                           #   other automation → a parent that is not ours
                           #
-                          # so only the first two are worth re-asserting against.
+                          # so only the first two are worth re-asserting against. The
+                          # "spurious flip" test is `unintentional_change` (top), applied
+                          # to the live state — keep the two in lockstep.
                           value_template: >-
+                            {% set c = states[target_light_id].context %}
                             {{ not wait.completed or repeat.index >= 3 or
-                               states[target_light_id].context.user_id is not none or
-                               (states[target_light_id].context.id != context.id and
-                                states[target_light_id].context.parent_id is not none) }}
+                               (c.id != context.id and
+                                not (c.user_id is none and
+                                     (c.parent_id is none or
+                                      (is_state(target_light_id, 'off') and
+                                       al_context_marker in c.id)))) }}
               # ── Sync ─────────────────────────────────────────────────────────
               - choose:
                   - conditions:
