@@ -18,6 +18,12 @@ blueprint:
     the off lands within HA's ~5 s context window after an Adaptive Lighting
     command and so inherits AL's context: AL never turns a light off, so an off in
     its context is always the device's own doing, never a decision.
+    On a plain Home Assistant restart the lights never lost power, so priming only
+    makes a Zigbee group flap; with an optional host-boot sensor the recovery path
+    primes on HA start only when the host itself has just booted. The restore waits
+    for the light to stop changing before judging the result (re-driving it if the
+    settled state is wrong) and syncs the Grenton switch to the restored target, never
+    to a momentary reading taken while the group is still flapping.
   domain: automation
   source_url: https://raw.githubusercontent.com/rumil/home-assistant/refs/heads/main/blueprints/switch-light-sync.yaml
   input:
@@ -136,6 +142,54 @@ blueprint:
         entity:
           domain: switch
           integration: adaptive_lighting
+    host_boot_sensor:
+      name: Host boot time sensor (optional)
+      description: >
+        Optional. Only relevant when "Restore previous state" is selected and the
+        recovery threshold is above 0. A timestamp sensor holding when the HOST last
+        booted (e.g. System Monitor's "Last boot"). On a plain Home Assistant restart
+        the lights never lost power, so priming them is pointless and, on a Zigbee2MQTT
+        group, makes it flap on/off for seconds while member reports arrive out of
+        order. When this is set, priming on HA start runs only if the host booted
+        within the window below (a real power cycle); otherwise the snapshot is still
+        restored, just without priming. Priming after the light itself recovers from
+        unavailable, or after a self-boot, is unaffected. Leave empty to prime on
+        every HA start (previous behaviour). A sensor with no valid timestamp also
+        falls back to priming.
+      default: ""
+      selector:
+        entity:
+          domain: sensor
+          device_class: timestamp
+    host_boot_window:
+      name: Host boot window
+      description: >
+        Only used with a host boot time sensor. HA start counts as a host boot (and
+        primes) when the host booted at most this long ago.
+      default: 10
+      selector:
+        number:
+          min: 1
+          max: 120
+          step: 1
+          unit_of_measurement: min
+    settle_time:
+      name: Settle time
+      description: >
+        Only relevant when "Restore previous state" is selected. After priming and
+        after each drive of the light to its target, wait until the light has
+        reported no on/off change for this long before judging the result (capped at
+        20 s per wait). A Zigbee2MQTT group can flap for many seconds as member
+        reports arrive out of order; judging it mid-flap gave up on a light that was
+        still moving. If the settled state is not the target, the light is driven
+        again (up to 5 attempts). 0 disables the wait.
+      default: 3
+      selector:
+        number:
+          min: 0
+          max: 15
+          step: 1
+          unit_of_measurement: s
 
 variables:
   target_light_id: !input target_light
@@ -146,6 +200,9 @@ variables:
   state_store_id: !input state_store
   saved_attributes: !input saved_attributes
   adaptive_lighting_switch_id: !input adaptive_lighting_switch
+  host_boot_sensor_id: !input host_boot_sensor
+  host_boot_window: !input host_boot_window
+  settle_time: !input settle_time
   # Whether a persistent state store is configured.
   has_store: "{{ state_store_id not in ['', 'unknown', 'unavailable', none] }}"
   # Whether an Adaptive Lighting switch is configured for this light. When true, the
@@ -161,7 +218,8 @@ variables:
   # THE definition of an UNINTENTIONAL change: nothing in HA decided it. Used by the
   # spurious-firmware-off branch, the pipeline's device_originated, and — applied to
   # the live state instead of the trigger — the foreign-change test in both repeat
-  # loops. Keep those inline copies in lockstep with this one.
+  # loops and the pipeline's `yielded`. Keep those inline copies in lockstep with
+  # this one.
   #
   #   no user_id AND no parent_id  → a pure device report.
   #   no user_id AND an OFF whose context ID is AL's → also the device. HA attributes
@@ -610,6 +668,19 @@ action:
                     {{ restore_data
                        if (intent == 'restore' and saved.get('state') == 'on')
                        else ({'brightness': prime_brightness | int} if needs_wake else {}) }}
+                  # Whether priming may run. Only HA start is gated: a plain Core
+                  # restart leaves the lights powered and their Zigbee link intact, so
+                  # there is no fragile cycle to spend — priming then only makes a Z2M
+                  # group flap (2026-10-05: three 255 turn_ons on a group holding the
+                  # snapshot 'off' flapped for ~15 s and the room ended up lit). So on
+                  # ha_start, prime only if the HOST booted within the window. Fails
+                  # safe to priming when no sensor is set (states('') is 'unknown') or
+                  # it holds no valid timestamp. light_recovered and self-boot always
+                  # prime — there the light really did lose its link.
+                  prime_allowed: >-
+                    {% set boot = as_datetime(states(host_boot_sensor_id), none) %}
+                    {{ trigger.id != 'ha_start' or boot is none
+                       or (now() - boot).total_seconds() <= host_boot_window | float(10) * 60 }}
               # ── Prime ────────────────────────────────────────────────────────
               # These bulbs are unreliable for exactly one on-cycle after their Zigbee
               # link is re-established: the first turn_on lands, and ~3 s later every
@@ -623,10 +694,13 @@ action:
               # at the last level they were COMMANDED to, so priming is what leaves them
               # with a usable remembered level for the next manual turn-on. Priming at
               # 10 % once left every fixture coming on dim.
+              #
+              # Skipped on an HA start that was not a host boot — see prime_allowed.
               - if:
                   - condition: template
                     value_template: >-
-                      {{ intent == 'restore' and recovery_brightness_threshold | int > 0 }}
+                      {{ intent == 'restore' and recovery_brightness_threshold | int > 0
+                         and prime_allowed }}
                 then:
                   - repeat:
                       sequence:
@@ -650,6 +724,23 @@ action:
                       until:
                         - condition: template
                           value_template: "{{ not wait.completed or repeat.index >= 3 }}"
+                  # Settle: let the group finish reacting to the priming before the
+                  # assert loop reads it. A Z2M group whose members report out of order
+                  # flaps for seconds after a burst of turn_ons, and a drive issued
+                  # mid-flap is judged against noise. Polls last_changed rather than
+                  # using a wait_template because now() in a wait_template re-renders
+                  # only once a minute. 0.5 s per poll, capped at 40 polls (20 s).
+                  # Same loop as the settle in the assert loop below — keep in lockstep.
+                  - repeat:
+                      while:
+                        - condition: template
+                          value_template: >-
+                            {{ repeat.index <= 40 and
+                               (now() - states[target_light_id].last_changed).total_seconds()
+                                 < settle_time | float(0) }}
+                      sequence:
+                        - delay:
+                            milliseconds: 500
               # ── Assert ───────────────────────────────────────────────────────
               # Applying the target once is not enough, and this is the subtle part.
               # Priming only proves the bulb accepts an ON — the target is a SEPARATE
@@ -704,15 +795,38 @@ action:
                         # re-assert".
                         - wait_template: "{{ states(target_light_id) != target_state }}"
                           timeout: "00:00:04"
+                        # Settle before judging. If the watch caught a flip, the group
+                        # may still be flapping (a 9-member group with off_state:
+                        # last_member_state flapped ~15 s on 2026-10-05); judging it
+                        # mid-flap burned all retries and left whatever the last
+                        # report said. Wait until it has been quiet for settle_time
+                        # (cap 20 s), then judge the SETTLED state below. With
+                        # settle_time ≤ 4 it is a no-op when the watch timed out, since
+                        # the light has then been quiet ~4 s already, so a clean restore
+                        # takes no longer than before. Same loop as the post-priming
+                        # settle above.
+                        - repeat:
+                            while:
+                              - condition: template
+                                value_template: >-
+                                  {{ repeat.index <= 40 and
+                                     (now() - states[target_light_id].last_changed).total_seconds()
+                                       < settle_time | float(0) }}
+                            sequence:
+                              - delay:
+                                  milliseconds: 500
                       until:
                         - condition: template
-                          # Stop on a FOREIGN change. Re-asserting exists to fight
+                          # Done when the settled state is the target, after 5 drives,
+                          # or on a FOREIGN change. Re-asserting exists to fight
                           # spurious device flips, never a deliberate command — a loop
                           # that cannot tell them apart switches off lights the user
                           # just turned on (Scenario A, 2026-07-22).
                           #
                           #   our own command  → the light carries THIS run's context id
-                          #                      (HA reuses it for the device's echo too)
+                          #                      (HA reuses it for the device's echo too),
+                          #                      or a child of it: AL's post-turn-on adapt
+                          #                      runs with our context as its parent
                           #   spurious flip    → fresh context, no user, no parent — or
                           #                      an OFF inheriting an AL command's context
                           #   user action      → user_id set
@@ -720,35 +834,52 @@ action:
                           #
                           # so only the first two are worth re-asserting against. The
                           # "spurious flip" test is `unintentional_change` (top), applied
-                          # to the live state — keep the two in lockstep.
+                          # to the live state — keep the two in lockstep, and keep this
+                          # whole foreign test in lockstep with `yielded` below.
                           value_template: >-
                             {% set c = states[target_light_id].context %}
-                            {{ not wait.completed or repeat.index >= 3 or
-                               (c.id != context.id and
+                            {{ states(target_light_id) == target_state or repeat.index >= 5 or
+                               (c.id != context.id and c.parent_id != context.id and
                                 not (c.user_id is none and
                                      (c.parent_id is none or
                                       (is_state(target_light_id, 'off') and
                                        al_context_marker in c.id)))) }}
               # ── Sync ─────────────────────────────────────────────────────────
+              # observe → the switch follows the light (the light is the truth).
+              # restore → the switch follows target_state, NEVER the momentary light.
+              # On 2026-10-05 a restore to 'off' read the flapping group at a transient
+              # 'on' (a report 20 ms earlier) and turned the switch on; grenton_changed
+              # then drove the light on for good. Following the target means a flap
+              # outlasting the assert loop can at worst leave the light briefly wrong
+              # with the switch right — and if the switch's own grenton_changed lands
+              # after this run, Scenario A drives the light to the target too.
+              #
+              # Except when the assert loop yielded: a user or another automation took
+              # the light over (the same foreign test as the loop's until, on the live
+              # state). Then the light IS someone's intent, so the switch follows it —
+              # syncing it to the snapshot would undo the takeover via Scenario A.
+              - variables:
+                  yielded: >-
+                    {% set c = states[target_light_id].context %}
+                    {{ c.id != context.id and c.parent_id != context.id and
+                       not (c.user_id is none and
+                            (c.parent_id is none or
+                             (is_state(target_light_id, 'off') and
+                              al_context_marker in c.id))) }}
+                  sync_to: >-
+                    {{ target_state if (intent == 'restore' and not yielded)
+                       else states(target_light_id) }}
               - choose:
                   - conditions:
-                      - condition: state
-                        entity_id: !input target_light
-                        state: "on"
-                      - condition: state
-                        entity_id: !input grenton_switch
-                        state: "off"
+                      - condition: template
+                        value_template: "{{ sync_to == 'on' and is_state(grenton_switch_id, 'off') }}"
                     sequence:
                       - service: switch.turn_on
                         target:
                           entity_id: !input grenton_switch
                   - conditions:
-                      - condition: state
-                        entity_id: !input target_light
-                        state: "off"
-                      - condition: state
-                        entity_id: !input grenton_switch
-                        state: "on"
+                      - condition: template
+                        value_template: "{{ sync_to == 'off' and is_state(grenton_switch_id, 'on') }}"
                     sequence:
                       - service: switch.turn_off
                         target:

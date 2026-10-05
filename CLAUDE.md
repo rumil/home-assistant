@@ -34,7 +34,7 @@ The `restore_previous` instances set `stored_traces: 30` (HA's default is 5), so
 
 - `ha_get_history` on the light, the switch, **and** the instance's `input_text` store, `order="asc"`. The store's transitions show what each run decided to persist.
 - `ha_get_logs(source="logbook", compact=False)` on the switch/light — `context_user_id` distinguishes a **user action** from a **device report** (firmware boot: no context at all) from an **automation's own call** (`context_domain: automation`).
-- Timing fingerprints the branch when the trace is gone: an observe run is **~1.0 s**; a restore run with priming is **~11 s** (1 s settle + prime 1 s + 4 s watch + restore 1 s + 4 s watch); Scenario A is **~1.0 s**. A light-side run lasting more than a couple of seconds means `intent: restore`.
+- Timing fingerprints the branch when the trace is gone: an observe run is **~1.0 s**; a restore run with priming is **~11 s** (1 s settle + prime 1 s + 4 s watch + restore 1 s + 4 s watch; the `settle_time` waits add nothing when the light holds, up to 20 s each when it flaps); Scenario A is **~1.0 s**. A light-side run lasting more than a couple of seconds means `intent: restore`.
 - `ha_get_logs(source="system")` — a burst of `<name>: Already running` entries means triggers are being dropped; cross-check against the desync window rather than assuming they are benign. The blueprint sets `max_exceeded: debug`, so these **no longer appear at WARNING** — an outage or restart makes `mode: single` drop dozens of self-inflicted re-entrant triggers per instance, which is by design and drowned the log. To see them, raise the level first: `logger.set_level` on `homeassistant.components.automation.<object_id>` = `debug`, then read with `level="DEBUG"`.
 - Recorder/logbook timestamps come back in **local time** (Europe/Warsaw) while trace timestamps are **UTC** — do not compare them without converting.
 
@@ -63,9 +63,9 @@ Two-way sync between a **Grenton virtual switch** and a **light** entity, resili
   settle (delay 1s + wait for brightness)
   classify → intent = restore | observe
   target  := snapshot (restore) | current light state (observe)
-  prime    (restore, threshold > 0)
-  assert   (skipped when there is nothing to assert)
-  sync switch
+  prime    (restore, threshold > 0, prime_allowed) + settle
+  assert   (skipped when there is nothing to assert; settle each pass, ≤ 5 drives)
+  sync switch  (restore → target_state unless yielded; observe → the light)
   save     (observe only)
   al release (restore or needs_wake, when has_al and light on)
   ```
@@ -92,6 +92,13 @@ Two-way sync between a **Grenton virtual switch** and a **light** entity, resili
 
 **`post_outage_behavior`** has only two values: `light_source_of_truth` (default) and `restore_previous`. `turn_on`/`turn_off` were removed in `27eb974` — unused by every live instance. The pipeline is gated on `restore_previous and has_store`, **not** on the threshold, so `recovery_brightness_threshold: 0` disables boot detection and priming only; the snapshot is still restored on recovery.
 
+**Restart hardening (2026-10-05).** A plain HA Core restart (host up, lights powered) once ended a restore to `{"state":"off"}` with the living room lit: three priming `turn_on`s made the 9-member Z2M group (`off_state: last_member_state`) flap for ~15 s, the assert loop burned its 3 tries mid-flap, the sync read a transient `on` 20 ms old and turned the switch on, and `grenton_changed` made it stick. Three changes, all in the pipeline:
+- **`host_boot_sensor`** (optional timestamp sensor, e.g. System Monitor "Last boot") + **`host_boot_window`** (min, default 10) → `prime_allowed`. On `ha_start` priming runs only when the host booted within the window; empty input or no valid timestamp fails safe to priming (old behaviour). `light_recovered`/self-boot always prime. Only priming is gated; the restore drive always runs. **No such sensor exists on the live instance yet** — until one is added and wired into the instances this gate is inert.
+- **Settle** (`settle_time`, s, default 3): after priming and after each assert pass, poll every 0.5 s (≤ 40 polls = 20 s) until `last_changed` is `settle_time` old. A `repeat`/`while` with `now()` in a condition, **not** a `wait_template` (`now()` there re-renders once a minute). The assert loop now judges the **settled** state and allows 5 drives (was 3).
+- **Sync on restore follows `target_state`**, never the momentary light — unless `yielded` (the assert loop's foreign test on the live state: a user or another automation took over), in which case the light is the intent and the switch follows it. Observe is unchanged.
+- The foreign test (assert loop + `yielded`) also treats a context whose **parent is this run** as ours: AL's post-turn-on adapt carries our context as parent and would otherwise read as "another automation". The spurious-firmware-off loop still lacks this clause.
+- Not covered: on 2026-10-05 16:21 the restore ended correctly, then the group flapped `on` **0.8 s after the run freed the slot**; the observe path synced the switch on and saved `{"state":"on"}`. The settle does not catch a flap that starts after a quiet watch window — `prime_allowed` (no priming → no flap) is the fix for that, so it needs the boot sensor configured.
+
 **`adaptive_lighting_switch`** (optional, `default: ""`) — the Adaptive Lighting instance's main switch (e.g. `switch.adaptive_lighting_main`) governing this light. Gated by the `has_al` variable (same shape as `has_store`) and referenced via a template, not `!input` (the optional-entity gotcha — an empty `!input` in a service `target:` fails config-load on every instance). When set, the pipeline's `al release` step clears AL's manual-control flag for this light at the end of a recovery. Non-breaking: instances that leave it empty behave exactly as before. Live instances map to different AL profiles, so it is per-instance (office → `switch.adaptive_lighting_main`). Added 2026-09-17.
 
 ## Blueprint conventions / gotchas
@@ -108,7 +115,7 @@ Two-way sync between a **Grenton virtual switch** and a **light** entity, resili
 
   | origin | the light's context | re-assert? |
   |---|---|---|
-  | our own command | this run's `context.id` (HA reuses it for the device echo, 5 s) | yes |
+  | our own command | this run's `context.id` (HA reuses it for the device echo, 5 s), or — assert loop only — a context whose parent is this run (AL's post-turn-on adapt) | yes |
   | spurious device flip | fresh, no user, no parent — or an **off** whose ID carries AL's `:al:` | yes |
   | user action | `user_id` set | **stop** |
   | another automation | a parent that is not ours | **stop** |
