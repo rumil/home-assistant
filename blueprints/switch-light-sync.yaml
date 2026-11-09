@@ -210,7 +210,12 @@ blueprint:
         delivered. If the light reports nothing back (e.g. Zigbee2MQTT is not running
         yet while the MQTT broker still replays its stale retained state), it re-checks
         every 10 s until Zigbee answers or the host boot window ends. A wall press
-        meanwhile makes the switch, not the saved snapshot, the target;
+        meanwhile makes the switch, not the saved snapshot, the target. If nothing
+        answers within the window, the recovery fires the event
+        switch_light_sync_recovery_failed (data: light, switch, waited_s — seconds
+        spent waiting) and stops without changing anything, so you can alert on it.
+        Once delivery is confirmed, one final command for the target state is always
+        sent, even when the light already reports that state;
         (3) the light is primed only when the restore ends ON. A restore that ends OFF
         is checked with one ON at the firmware boot level (the glow the bulbs already
         show after a power cut) and then switched off, so there is no bright flash at
@@ -731,6 +736,10 @@ action:
                   # switch while Zigbee is not delivering: from then on the live switch,
                   # not the snapshot, is the target. Always false without quiet_recovery.
                   follow_switch: false
+                  # Set by the wait-for-Zigbee block below once delivery is confirmed:
+                  # the assert loop then sends its first command even when the light
+                  # already reads the goal. Always false without quiet_recovery.
+                  final_command: false
                   # How long the light must stay quiet before a result is judged. With
                   # quiet_recovery the settle measures last_updated (any report, not
                   # just on/off) for at least 6 s — longer than HA's 5 s window during
@@ -778,8 +787,9 @@ action:
               # it is the user's intent: the wait watches for it and from then on the
               # live switch, not the snapshot, is the target (follow_switch).
               #
-              # Never past the window: if Zigbee never answers, stop without
-              # restoring, syncing or saving — the trace shows delivered: false.
+              # Never past the window: if Zigbee never answers, fire
+              # switch_light_sync_recovery_failed and stop without restoring,
+              # syncing or saving — the trace shows delivered: false.
               - if:
                   - condition: template
                     value_template: >-
@@ -861,11 +871,31 @@ action:
                         {{ states(target_light_id) in ['on', 'off'] and
                            as_timestamp(states[target_light_id].last_updated)
                              > check_since | float }}
+                  # Undelivered: announce it before stopping. This is the only reliable
+                  # sign that Zigbee2MQTT never came up after a power cut — its bridge
+                  # connection sensor cannot be trusted then (the broker replays a
+                  # stale retained "online"). Fired once, only here; nothing listens
+                  # unless the user adds an automation for it.
                   - if:
                       - condition: template
                         value_template: "{{ not delivered }}"
                     then:
+                      - event: switch_light_sync_recovery_failed
+                        event_data:
+                          light: "{{ target_light_id }}"
+                          switch: "{{ grenton_switch_id }}"
+                          waited_s: "{{ (now().timestamp() - check_since | float) | int }}"
                       - stop: "Zigbee did not deliver within the host boot window"
+                  # Delivered: the assert loop's first pass must command the goal even
+                  # if the light already reads it. A group with off_state:
+                  # last_member_state can read "off" while fixtures still glow at the
+                  # check level (a member report lost), and the report that confirmed
+                  # delivery may not have been caused by the check at all (Z2M
+                  # publishing group state at its own start), so the check may never
+                  # have reached the fixtures. A turn_off to a light that is really
+                  # off changes nothing.
+                  - variables:
+                      final_command: true
               # ── Prime ────────────────────────────────────────────────────────
               # These bulbs are unreliable for exactly one on-cycle after their Zigbee
               # link is re-established: the first turn_on lands, and ~3 s later every
@@ -990,10 +1020,13 @@ action:
                               {{ states(grenton_switch_id)
                                  if (follow_switch and states(grenton_switch_id) in ['on', 'off'])
                                  else target_state }}
+                        # final_command: after a confirmed delivery the first pass
+                        # always commands the goal (see the wait for Zigbee).
                         - if:
                             - condition: template
                               value_template: >-
-                                {{ states(target_light_id) != goal or
+                                {{ (final_command and repeat.first) or
+                                   states(target_light_id) != goal or
                                    (apply_data | length > 0 and not follow_switch) }}
                           then:
                             - choose:
