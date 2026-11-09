@@ -23,7 +23,12 @@ blueprint:
     primes on HA start only when the host itself has just booted. The restore waits
     for the light to stop changing before judging the result (re-driving it if the
     settled state is wrong) and syncs the Grenton switch to the restored target, never
-    to a momentary reading taken while the group is still flapping.
+    to a momentary reading taken while the group is still flapping. Optional quiet
+    recovery (off by default) primes only after a host boot on every recovery path,
+    so a Zigbee2MQTT or HA restart never flashes the lights. After a host boot it waits
+    until Zigbee actually delivers commands, even if Zigbee2MQTT starts minutes after
+    Home Assistant behind stale retained MQTT state. It primes only when the restore
+    ends ON, so a restore to OFF brings no bright flash at night.
   domain: automation
   source_url: https://raw.githubusercontent.com/rumil/home-assistant/refs/heads/main/blueprints/switch-light-sync.yaml
   input:
@@ -165,7 +170,8 @@ blueprint:
       name: Host boot window
       description: >
         Only used with a host boot time sensor. HA start counts as a host boot (and
-        primes) when the host booted at most this long ago.
+        primes) when the host booted at most this long ago. With quiet recovery on,
+        this is also how long the recovery keeps waiting for Zigbee to answer.
       default: 10
       selector:
         number:
@@ -182,7 +188,8 @@ blueprint:
         20 s per wait). A Zigbee2MQTT group can flap for many seconds as member
         reports arrive out of order; judging it mid-flap gave up on a light that was
         still moving. If the settled state is not the target, the light is driven
-        again (up to 5 attempts). 0 disables the wait.
+        again (up to 5 attempts). 0 disables the wait. With quiet recovery on, the
+        recovery path waits for at least 6 s of no reports at all.
       default: 3
       selector:
         number:
@@ -190,6 +197,30 @@ blueprint:
           max: 15
           step: 1
           unit_of_measurement: s
+    quiet_recovery:
+      name: Quiet recovery (optional)
+      description: >
+        Only relevant when "Restore previous state" is selected, the recovery
+        threshold is above 0 and a host boot time sensor is set. Off keeps the
+        previous behaviour. When on:
+        (1) priming after the light returns from unknown/unavailable is also limited
+        to the host boot window, not only on HA start, so a Zigbee2MQTT restart or
+        update, or a plain HA restart, never flashes the lights;
+        (2) after a host boot the recovery checks that its first command was
+        delivered. If the light reports nothing back (e.g. Zigbee2MQTT is not running
+        yet while the MQTT broker still replays its stale retained state), it re-checks
+        every 10 s until Zigbee answers or the host boot window ends. A wall press
+        meanwhile makes the switch, not the saved snapshot, the target;
+        (3) the light is primed only when the restore ends ON. A restore that ends OFF
+        is checked with one ON at the firmware boot level (the glow the bulbs already
+        show after a power cut) and then switched off, so there is no bright flash at
+        night. The bulbs' fragile first on-cycle is then left to the next turn-on,
+        where the spurious-off re-drive covers it;
+        (4) the recovery holds until the light has reported nothing for at least 6 s,
+        so a late echo of its own commands cannot be mistaken for a device report.
+      default: false
+      selector:
+        boolean: {}
 
 variables:
   target_light_id: !input target_light
@@ -203,6 +234,7 @@ variables:
   host_boot_sensor_id: !input host_boot_sensor
   host_boot_window: !input host_boot_window
   settle_time: !input settle_time
+  quiet_recovery: !input quiet_recovery
   # Whether a persistent state store is configured.
   has_store: "{{ state_store_id not in ['', 'unknown', 'unavailable', none] }}"
   # Whether an Adaptive Lighting switch is configured for this light. When true, the
@@ -677,10 +709,163 @@ action:
                   # safe to priming when no sensor is set (states('') is 'unknown') or
                   # it holds no valid timestamp. light_recovered and self-boot always
                   # prime — there the light really did lose its link.
+                  #
+                  # With quiet_recovery, light_recovered is gated the same way. On a
+                  # Z2M group it never means a lone fixture dropped off: in 10 days of
+                  # history (2026-10-30..11-09) the track groups went unavailable only
+                  # together with the bridge — every Z2M restart/update (04:52, 00:21,
+                  # 04:10, 22:07) came back through light_recovered and flashed the
+                  # rooms at night — and a group with no retained state comes back
+                  # from unknown ~40 s after every plain HA restart (bedroom,
+                  # 2026-11-08 22:14). Self-boot keeps priming: the bulb itself
+                  # re-powered.
+                  host_boot_ts: "{{ as_timestamp(states(host_boot_sensor_id), none) }}"
+                  boot_recent: >-
+                    {{ host_boot_ts is not none and
+                       now().timestamp() - host_boot_ts <= host_boot_window | float(10) * 60 }}
                   prime_allowed: >-
-                    {% set boot = as_datetime(states(host_boot_sensor_id), none) %}
-                    {{ trigger.id != 'ha_start' or boot is none
-                       or (now() - boot).total_seconds() <= host_boot_window | float(10) * 60 }}
+                    {{ trigger.id not in (['ha_start', 'light_recovered'] if quiet_recovery
+                                          else ['ha_start'])
+                       or host_boot_ts is none or boot_recent }}
+                  # Set by the wait-for-Zigbee loop below when the user presses the wall
+                  # switch while Zigbee is not delivering: from then on the live switch,
+                  # not the snapshot, is the target. Always false without quiet_recovery.
+                  follow_switch: false
+                  # How long the light must stay quiet before a result is judged. With
+                  # quiet_recovery the settle measures last_updated (any report, not
+                  # just on/off) for at least 6 s — longer than HA's 5 s window during
+                  # which a device report reuses the context of the command before it.
+                  # Every run of this automation (ha_start included: its context has no
+                  # parent, trace 992bb727) issues commands with user_id AND parent_id
+                  # null, so an echo that outlived the run would read as the device's
+                  # own doing: a spurious off, or a self-boot from the 1 → 252 → 255
+                  # turn-on ramp. Holding the slot through 6 s of silence drops them all.
+                  settle_need: >-
+                    {{ ([settle_time | float(0), 6] | max) if quiet_recovery
+                       else settle_time | float(0) }}
+              # ── Wait for Zigbee (quiet_recovery, after a host boot) ───────────
+              # 2026-11-09 power cut: the host booted 08:59:48, the router came up
+              # later, and Z2M restart-looped (coordinator unreachable over TCP) until
+              # 09:02:00. Mosquitto's persistence had kept the retained messages from
+              # before the outage — bridge/state "online" and the groups "off" — and
+              # replayed them when HA connected at 09:00:48, so every group looked
+              # available and off while nothing could reach it. The 09:01:29 ha_start
+              # recovery primed three times into the void (the dropout watch sees the
+              # stale "off" and completes at once), found state == target, and
+              # "succeeded"; the fixtures stayed at their power-on glow.
+              #
+              # A command that should change the state but is followed by NO report
+              # at all was not delivered. So the first command doubles as a delivery
+              # check, and a command was delivered when the light reported anything
+              # (last_updated moved) after it — Z2M publishes a group's state as soon
+              # as it sends the group command. The check must be a command that
+              # changes what the light reports, or a live Z2M would look dead:
+              #   target on  → the first prime (prime_brightness - 1 if the light
+              #                already reads on at exactly prime_brightness)
+              #   target off, reads on  → turn_off
+              #   target off, reads off → ON at the firmware boot level (the
+              #                threshold): the glow the bulbs already show after a
+              #                power cut, so nothing visible; switched off below.
+              # Undelivered → wait up to 10 s and check again, until Zigbee answers
+              # or the host boot window ends. Polling the light, not
+              # zigbee2mqtt/bridge/state: its retained "online" is replayed on every
+              # HA start and automation reload and can be stale, and an mqtt-triggered
+              # run would be a second run racing this one under mode:single. Polling
+              # loses nothing — a Z2M start during any step is caught by the next check.
+              #
+              # The slot is held while waiting, so a wall press meanwhile has its own
+              # grenton_changed dropped. It could not have reached the light anyway, but
+              # it is the user's intent: the wait watches for it and from then on the
+              # live switch, not the snapshot, is the target (follow_switch).
+              #
+              # Never past the window: if Zigbee never answers, stop without
+              # restoring, syncing or saving — the trace shows delivered: false.
+              - if:
+                  - condition: template
+                    value_template: >-
+                      {{ quiet_recovery and intent == 'restore'
+                         and recovery_brightness_threshold | int > 0
+                         and trigger.id in ['ha_start', 'light_recovered'] and boot_recent }}
+                then:
+                  - variables:
+                      check_since: "{{ now().timestamp() }}"
+                  - repeat:
+                      sequence:
+                        - choose:
+                            - conditions:
+                                - condition: template
+                                  value_template: >-
+                                    {{ (states(grenton_switch_id)
+                                        if (follow_switch and
+                                            states(grenton_switch_id) in ['on', 'off'])
+                                        else target_state) == 'on' }}
+                              sequence:
+                                - service: light.turn_on
+                                  target:
+                                    entity_id: !input target_light
+                                  data:
+                                    brightness: >-
+                                      {{ prime_brightness | int - 1
+                                         if (is_state(target_light_id, 'on') and
+                                             state_attr(target_light_id, 'brightness') | int(0)
+                                               == prime_brightness | int)
+                                         else prime_brightness | int }}
+                            - conditions:
+                                - condition: state
+                                  entity_id: !input target_light
+                                  state: "on"
+                              sequence:
+                                - service: light.turn_off
+                                  target:
+                                    entity_id: !input target_light
+                          default:
+                            - service: light.turn_on
+                              target:
+                                entity_id: !input target_light
+                              data:
+                                brightness: "{{ recovery_brightness_threshold | int }}"
+                        # Wakes on any report from the light (delivery), or on a wall
+                        # press; otherwise re-checks after 10 s.
+                        - wait_for_trigger:
+                            - platform: state
+                              entity_id: !input target_light
+                              id: "light"
+                            - platform: state
+                              entity_id: !input grenton_switch
+                              id: "press"
+                              not_from:
+                                - unknown
+                                - unavailable
+                              not_to:
+                                - unknown
+                                - unavailable
+                          timeout: "00:00:10"
+                        - if:
+                            - condition: template
+                              value_template: >-
+                                {{ wait.trigger is not none and wait.trigger.id == 'press' }}
+                          then:
+                            - variables:
+                                follow_switch: true
+                      until:
+                        - condition: template
+                          value_template: >-
+                            {{ (states(target_light_id) in ['on', 'off'] and
+                                as_timestamp(states[target_light_id].last_updated)
+                                  > check_since | float)
+                               or now().timestamp() - host_boot_ts
+                                    > host_boot_window | float(10) * 60
+                               or repeat.index >= 720 }}
+                  - variables:
+                      delivered: >-
+                        {{ states(target_light_id) in ['on', 'off'] and
+                           as_timestamp(states[target_light_id].last_updated)
+                             > check_since | float }}
+                  - if:
+                      - condition: template
+                        value_template: "{{ not delivered }}"
+                    then:
+                      - stop: "Zigbee did not deliver within the host boot window"
               # ── Prime ────────────────────────────────────────────────────────
               # These bulbs are unreliable for exactly one on-cycle after their Zigbee
               # link is re-established: the first turn_on lands, and ~3 s later every
@@ -696,19 +881,40 @@ action:
               # 10 % once left every fixture coming on dim.
               #
               # Skipped on an HA start that was not a host boot — see prime_allowed.
+              #
+              # With quiet_recovery, skipped too when the restore ends OFF: priming
+              # needs a real ON at a sensible level, which at night is a bright flash
+              # in a room that is about to go dark. The fragile cycle then falls on the
+              # next turn-on, where the spurious-firmware-off branch re-drives the
+              # drop, and Scenario A's wake lifts the remembered boot level.
               - if:
                   - condition: template
                     value_template: >-
                       {{ intent == 'restore' and recovery_brightness_threshold | int > 0
-                         and prime_allowed }}
+                         and prime_allowed
+                         and (not quiet_recovery or
+                              (states(grenton_switch_id)
+                               if (follow_switch and states(grenton_switch_id) in ['on', 'off'])
+                               else target_state) == 'on') }}
                 then:
                   - repeat:
                       sequence:
-                        - service: light.turn_on
-                          target:
-                            entity_id: !input target_light
-                          data:
-                            brightness: "{{ prime_brightness | int }}"
+                        # The delivery check above may already have been this prime:
+                        # the light then reads on at prime_brightness. Do not send it
+                        # twice — every extra turn_on lengthens a Z2M group's flap.
+                        - if:
+                            - condition: template
+                              value_template: >-
+                                {{ not (quiet_recovery and repeat.first
+                                        and is_state(target_light_id, 'on')
+                                        and state_attr(target_light_id, 'brightness') | int(0)
+                                              == prime_brightness | int) }}
+                          then:
+                            - service: light.turn_on
+                              target:
+                                entity_id: !input target_light
+                              data:
+                                brightness: "{{ prime_brightness | int }}"
                         # Let the command reach the device before judging the result.
                         - delay: "00:00:01"
                         # Watch for the spurious dropout: this goes true if the bulb
@@ -730,14 +936,17 @@ action:
                   # mid-flap is judged against noise. Polls last_changed rather than
                   # using a wait_template because now() in a wait_template re-renders
                   # only once a minute. 0.5 s per poll, capped at 40 polls (20 s).
-                  # Same loop as the settle in the assert loop below — keep in lockstep.
+                  # With quiet_recovery it measures last_updated against settle_need
+                  # (see there). Same loop as the settle in the assert loop below — keep
+                  # in lockstep.
                   - repeat:
                       while:
                         - condition: template
                           value_template: >-
                             {{ repeat.index <= 40 and
-                               (now() - states[target_light_id].last_changed).total_seconds()
-                                 < settle_time | float(0) }}
+                               (now() - (states[target_light_id].last_updated if quiet_recovery
+                                         else states[target_light_id].last_changed)
+                               ).total_seconds() < settle_need | float(0) }}
                       sequence:
                         - delay:
                             milliseconds: 500
@@ -768,21 +977,34 @@ action:
                 then:
                   - repeat:
                       sequence:
+                        # This pass's target: target_state, or — after a wall press
+                        # during the wait for Zigbee (follow_switch) — the LIVE switch,
+                        # re-read every pass so a press whose own trigger mode:single
+                        # dropped (an on then off a few seconds later) is still
+                        # honoured, as a bare on/off like Scenario A's. Never an
+                        # 'unavailable' switch (a Grenton restart): that falls back to
+                        # target_state. The until below inlines the same expression —
+                        # keep the two, and the sync's, in lockstep.
+                        - variables:
+                            goal: >-
+                              {{ states(grenton_switch_id)
+                                 if (follow_switch and states(grenton_switch_id) in ['on', 'off'])
+                                 else target_state }}
                         - if:
                             - condition: template
                               value_template: >-
-                                {{ states(target_light_id) != target_state or
-                                   apply_data | length > 0 }}
+                                {{ states(target_light_id) != goal or
+                                   (apply_data | length > 0 and not follow_switch) }}
                           then:
                             - choose:
                                 - conditions:
                                     - condition: template
-                                      value_template: "{{ target_state == 'on' }}"
+                                      value_template: "{{ goal == 'on' }}"
                                   sequence:
                                     - service: light.turn_on
                                       target:
                                         entity_id: !input target_light
-                                      data: "{{ apply_data }}"
+                                      data: "{{ {} if follow_switch else apply_data }}"
                               default:
                                 - service: light.turn_off
                                   target:
@@ -793,7 +1015,7 @@ action:
                         # leaving wait.completed false — when it holds, so a timeout is
                         # the success signal and a completed wait means "it flipped,
                         # re-assert".
-                        - wait_template: "{{ states(target_light_id) != target_state }}"
+                        - wait_template: "{{ states(target_light_id) != goal }}"
                           timeout: "00:00:04"
                         # Settle before judging. If the watch caught a flip, the group
                         # may still be flapping (a 9-member group with off_state:
@@ -804,14 +1026,18 @@ action:
                         # settle_time ≤ 4 it is a no-op when the watch timed out, since
                         # the light has then been quiet ~4 s already, so a clean restore
                         # takes no longer than before. Same loop as the post-priming
-                        # settle above.
+                        # settle above. With quiet_recovery this is also the run's
+                        # quiet tail: the last pass cannot end until the light has
+                        # reported nothing for settle_need (≥ 6 s), so no echo of this
+                        # run's commands outlives it.
                         - repeat:
                             while:
                               - condition: template
                                 value_template: >-
                                   {{ repeat.index <= 40 and
-                                     (now() - states[target_light_id].last_changed).total_seconds()
-                                       < settle_time | float(0) }}
+                                     (now() - (states[target_light_id].last_updated if quiet_recovery
+                                               else states[target_light_id].last_changed)
+                                     ).total_seconds() < settle_need | float(0) }}
                             sequence:
                               - delay:
                                   milliseconds: 500
@@ -838,7 +1064,10 @@ action:
                           # whole foreign test in lockstep with `yielded` below.
                           value_template: >-
                             {% set c = states[target_light_id].context %}
-                            {{ states(target_light_id) == target_state or repeat.index >= 5 or
+                            {% set goal = states(grenton_switch_id)
+                                 if (follow_switch and states(grenton_switch_id) in ['on', 'off'])
+                                 else target_state %}
+                            {{ states(target_light_id) == goal or repeat.index >= 5 or
                                (c.id != context.id and c.parent_id != context.id and
                                 not (c.user_id is none and
                                      (c.parent_id is none or
@@ -858,6 +1087,9 @@ action:
               # the light over (the same foreign test as the loop's until, on the live
               # state). Then the light IS someone's intent, so the switch follows it —
               # syncing it to the snapshot would undo the takeover via Scenario A.
+              #
+              # With follow_switch the target IS the live switch, so this is a no-op:
+              # the user's press stands.
               - variables:
                   yielded: >-
                     {% set c = states[target_light_id].context %}
@@ -867,7 +1099,10 @@ action:
                              (is_state(target_light_id, 'off') and
                               al_context_marker in c.id))) }}
                   sync_to: >-
-                    {{ target_state if (intent == 'restore' and not yielded)
+                    {% set goal = states(grenton_switch_id)
+                         if (follow_switch and states(grenton_switch_id) in ['on', 'off'])
+                         else target_state %}
+                    {{ goal if (intent == 'restore' and not yielded)
                        else states(target_light_id) }}
               - choose:
                   - conditions:
