@@ -14,10 +14,14 @@ blueprint:
     automation behind it — and restores the saved state instead of leaving it lit.
     A light that switches itself OFF while the switch is still ON (a known firmware
     fault) is re-driven to the switch with no transition, so it returns immediately,
-    instead of being synced off — including when
-    the off lands within HA's ~5 s context window after an Adaptive Lighting
-    command and so inherits AL's context: AL never turns a light off, so an off in
-    its context is always the device's own doing, never a decision.
+    instead of being synced off. "Switched itself off" means no service call is
+    behind the off: Home Assistant created the state's context at the moment of the
+    report. Every deliberate off arrives in its caller's context and is synced to the
+    switch, including callers that carry no user and no parent (Assist voice
+    satellites, HomeKit Bridge, time-triggered automations). Two inherited contexts
+    still count as the device: an off within HA's ~5 s context window after an
+    Adaptive Lighting command (AL never turns a light off), and an off in the same
+    context that just turned the light on (one command cannot mean both).
     On a plain Home Assistant restart the lights never lost power, so priming only
     makes a Zigbee group flap; with an optional host-boot sensor the recovery path
     primes on HA start only when the host itself has just booted. The restore waits
@@ -252,32 +256,83 @@ variables:
   # exactly this substring). The marker is in the context's ID; its parent_id is
   # whoever called AL (an automation, a user) and carries no marker.
   al_context_marker: ":al:"
+  # Crockford base32, the alphabet of a ULID. A context ID is a ULID whose first 10
+  # characters encode the millisecond it was created; decoded below to tell a
+  # context HA minted for a device report from one a service call brought along.
+  ulid_alphabet: "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
   # THE definition of an UNINTENTIONAL change: nothing in HA decided it. Used by the
   # spurious-firmware-off branch, the pipeline's device_originated, and — applied to
   # the live state instead of the trigger — the foreign-change test in both repeat
   # loops and the pipeline's `yielded`. Keep those inline copies in lockstep with
-  # this one.
+  # this one (they carry the first two clauses; the third needs from_state).
   #
-  #   no user_id AND no parent_id  → a pure device report.
-  #   no user_id AND an OFF whose context ID is AL's → also the device. HA attributes
-  #     any state write within ~5 s of a service call to that call's context, so a
-  #     firmware self-off landing right after an AL adapt inherits AL's context (with
-  #     the calling automation as parent_id). AL never turns a light off, so an off in
-  #     its context is never AL's decision. Diagnosed 2026-09-28 (hall_track, trace
-  #     ab9beeee): the grace-period automation cleared manual_control, AL adapted, the
-  #     TS0502B group dropped off 1 s later, and with parent_id set the off was taken
-  #     for intentional — the switch was synced off and the store saved {"state":"off"}.
+  # The test is "no service call is behind this state", read from how HA builds the
+  # state's context (core.py StateMachine.async_set_internal, helpers/entity.py):
+  # every entity service call stamps its context on the entity, and every state
+  # write within 5 s reuses it. Only when no call touched the entity for 5 s does HA
+  # mint a NEW context for the write — Context(id=ulid_at_time(timestamp)), so its ID
+  # encodes the write's own millisecond. A context that came with a call was created
+  # before the call, and a real device answers ≥ tens of ms later (measured
+  # 2026-11-18: every pure device report on the instance decoded to diff 0 ms, every
+  # commanded state to 120–530 ms; a voice off to 4.5 s, its pipeline began at the
+  # wake word).
   #
-  # Deliberately limited to OFF: after every turn-on AL adapts in a context whose
-  # parent is the turn-on's own (the user's) context, so an ON in AL's context is
-  # routinely the tail of a deliberate action. Counting those as unintentional would
-  # let needs_wake fight AL's night-time brightness.
+  #   1. minted context: no user, no parent, ID time == last_updated (±1 ms of
+  #      float rounding) → a pure device report.
+  #
+  #      Until 2026-11-18 this read "no user_id AND no parent_id". That also matched
+  #      every service call made in an ANONYMOUS context: an Assist voice satellite
+  #      (assist_satellite: `context or Context()` at pipeline start; the intent
+  #      calls light.turn_off with it), HomeKit Bridge (Context() per call), an
+  #      automation fired by a time trigger (no trigger context → Context(parent_id=
+  #      None)) and whatever it calls. A voice "turn off" with the switch on was
+  #      taken for the firmware fault and re-lit within ~0.3 s (office, 2026-11-18
+  #      17:25:39). Such calls are deliberate and now sync to the switch like any
+  #      other off.
+  #
+  #   2. an OFF whose context ID is AL's (and no user) → also the device. A
+  #      firmware self-off landing within 5 s of an AL adapt inherits AL's context
+  #      (with the calling automation as parent_id). AL never turns a light off, so
+  #      an off in its context is never AL's decision. Diagnosed 2026-09-28
+  #      (hall_track, trace ab9beeee): the grace-period automation cleared
+  #      manual_control, AL adapted, the TS0502B group dropped off 1 s later, and with
+  #      parent_id set the off was taken for intentional — the switch was synced off
+  #      and the store saved {"state":"off"}. Deliberately limited to OFF: after every
+  #      turn-on AL adapts in a context whose parent is the turn-on's own (the
+  #      user's) context, so an ON in AL's context is routinely the tail of a
+  #      deliberate action. Counting those as unintentional would let needs_wake
+  #      fight AL's night-time brightness.
+  #
+  #   3. ON → OFF in ONE context that itself turned the light on (the light became on
+  #      after that context was created) → the device. One command switches a light
+  #      one way; a context that lit it cannot also have meant it dark seconds later.
+  #      This is the post-turn-on firmware drop (~3 s after a turn-on, inside the 5 s
+  #      reuse) under whatever context did the turn-on: a voice or HomeKit "on" (which
+  #      clause 1's old form covered by accident), this automation's own re-drive or
+  #      restore once its run has ended, a wall press via Scenario A, an HA-app
+  #      turn-on. The last-changed test keeps a deliberate off with a fade (the
+  #      light reports dimming "on" states in the off's context first) intentional:
+  #      that light came on long before the off's context existed. Not covered: one
+  #      script run that turns a light on and off again within 5 s while the switch
+  #      is on is read as the device and re-lit.
+  #
+  # Every clause fails toward "intentional" if HA ever changes how it mints contexts:
+  # firmware offs would then be synced off (the pre-2026-09-17 behaviour), never a
+  # deliberate off reverted.
   unintentional_change: >-
-    {{ trigger.to_state is defined and trigger.to_state is not none
-       and trigger.to_state.context.user_id is none
-       and (trigger.to_state.context.parent_id is none
-            or (trigger.to_state.state == 'off'
-                and al_context_marker in trigger.to_state.context.id)) }}
+    {%- set s = trigger.to_state if trigger.to_state is defined else none %}
+    {%- set f = trigger.from_state if trigger.from_state is defined else none %}
+    {%- if s is none %}{{ false }}{% else %}
+    {%- set c = s.context %}
+    {%- set ns = namespace(t=0) %}
+    {%- for ch in c.id[:10] | upper %}{% set ns.t = ns.t * 32 + ulid_alphabet.find(ch) %}{% endfor %}
+    {{- (c.user_id is none and c.parent_id is none
+        and ((s.last_updated.timestamp() * 1000) | int - ns.t) | abs <= 1)
+       or (s.state == 'off' and c.user_id is none and al_context_marker in c.id)
+       or (s.state == 'off' and f is not none and f.state == 'on'
+           and f.context.id == c.id
+           and (f.last_changed.timestamp() * 1000) | int >= ns.t) }}
+    {%- endif %}
   # The saved snapshot (parsed from the store), read once at run start. Empty dict
   # when no store is configured or the store holds no valid JSON yet.
   saved: >-
@@ -474,13 +529,16 @@ action:
       # transition: minutes after the last turn-on, ~all group members report OFF at
       # FULL brightness (not the 1 % boot level) with no HA command behind it — a
       # firmware bug (Z2M #13148), diagnosed here 2026-09-17. It is unintentional (see
-      # `unintentional_change`: no user_id, and no parent_id or an AL context ID),
-      # which is exactly what separates it from every real off: a Grenton wall press
-      # reaches the light through Scenario A and stamps parent_id; an HA-app off stamps
-      # user_id; another automation's off stamps its own context as parent. When the
-      # drop lands within ~5 s of an AL command it inherits AL's context instead of a
-      # fresh one — that case reached the pipeline until 2026-09-28 and was persisted
-      # as the light's real state.
+      # `unintentional_change`): no service call is behind it, so HA minted its
+      # context at the moment of the report. That is exactly what separates it from
+      # every real off, which arrives in the context of the call that caused it — a
+      # wall press via Scenario A, an HA-app off, another automation, and equally a
+      # voice satellite, HomeKit or a time-triggered automation, whose contexts carry
+      # no user and no parent (until 2026-11-18 those were mistaken for the device
+      # and re-lit). When the drop lands within ~5 s of an AL command it inherits
+      # AL's context instead — that case reached the pipeline until 2026-09-28 and was
+      # persisted as the light's real state; within ~5 s of whatever turned the light
+      # on, it inherits that turn-on's context (clause 3 of the definition).
       #
       # Left to the pipeline/catch-all this off is taken for the light's own state:
       # the switch is synced OFF and (on a restore_previous instance) the store is
@@ -491,7 +549,7 @@ action:
       # settle is needed to classify) — it applies to every instance, because the bug
       # is universal to these bulbs and the fix needs no store: it drives to the
       # switch. A normal off still falls through to the branches below, because it
-      # carries a user_id or a non-AL parent_id and fails the unintentional test here.
+      # carries its caller's context and fails the unintentional test here.
       #
       # This is safe where the 2026-07-22 re-assert loop was not, for the same two
       # reasons Scenario A's defend loop was (see the foreign-change table in
@@ -567,12 +625,16 @@ action:
                   # repeat self-off in AL's context — AL re-adapting after our re-drive
                   # — is re-driven rather than taken for a decision.
                   value_template: >-
-                    {% set c = states[target_light_id].context %}
+                    {% set s = states[target_light_id] %}
+                    {% set c = s.context %}
+                    {% set ns = namespace(t=0) %}
+                    {%- for ch in c.id[:10] | upper %}{% set ns.t = ns.t * 32 + ulid_alphabet.find(ch) %}{% endfor %}
                     {{ states(target_light_id) == states(grenton_switch_id)
                        or repeat.index >= 3
                        or (c.id != context.id and
                            not (c.user_id is none and
-                                (c.parent_id is none or
+                                ((c.parent_id is none and
+                                  ((s.last_updated.timestamp() * 1000) | int - ns.t) | abs <= 1) or
                                  (is_state(target_light_id, 'off') and
                                   al_context_marker in c.id)))) }}
 
@@ -647,15 +709,18 @@ action:
                     {{ (trigger.from_state.attributes.get('brightness', 0)
                         if (trigger.from_state is defined and trigger.from_state is not none)
                         else 0) | int(0) }}
-                  # Nothing in HA decided this state — neither a user nor an automation.
-                  # One definition, shared with the spurious-off branch and the repeat
-                  # loops: see `unintentional_change` at the top.
+                  # Nothing in HA decided this state — no user, automation, voice
+                  # satellite or bridge. One definition, shared with the spurious-off
+                  # branch and the repeat loops: see `unintentional_change` at the top.
                   #
-                  # user_id alone is not enough: a Grenton wall-switch press reaches the
-                  # light through Scenario A, whose service call leaves user_id null but
-                  # DOES stamp parent_id. Requiring no parent (or, for an off, AL's
-                  # context) is what separates a device-originated report from every
-                  # path HA itself can take.
+                  # Neither user_id nor parent_id is enough: a Grenton wall-switch press
+                  # reaches the light through Scenario A with user_id null, and a voice
+                  # satellite's or HomeKit's call has neither. Only a context HA minted
+                  # for the report itself (or an off in AL's context, or an off in the
+                  # same context that turned the light on) separates a
+                  # device-originated report from every path HA itself can take. On
+                  # this path that also keeps a voice turn-on that lands at the boot
+                  # level from being taken for a self-boot and "restored".
                   #
                   # Do NOT use bare `context` here: HA builds an automation's own context
                   # as Context(parent_id=<trigger context id>) and never copies user_id
@@ -746,9 +811,12 @@ action:
                   # which a device report reuses the context of the command before it.
                   # Every run of this automation (ha_start included: its context has no
                   # parent, trace 992bb727) issues commands with user_id AND parent_id
-                  # null, so an echo that outlived the run would read as the device's
-                  # own doing: a spurious off, or a self-boot from the 1 → 252 → 255
-                  # turn-on ramp. Holding the slot through 6 s of silence drops them all.
+                  # null. Under the pre-2026-11-18 unintentional test an echo that
+                  # outlived the run read as the device's own doing (a spurious off, or a
+                  # self-boot from the 1 → 252 → 255 turn-on ramp); the minted-context
+                  # test now reads it as ours. The tail stays because it also keeps a
+                  # flapping group's late reports inside the slot, where they cannot
+                  # reach the observe path and be synced or saved.
                   settle_need: >-
                     {{ ([settle_time | float(0), 6] | max) if quiet_recovery
                        else settle_time | float(0) }}
@@ -1086,24 +1154,32 @@ action:
                           #                      (HA reuses it for the device's echo too),
                           #                      or a child of it: AL's post-turn-on adapt
                           #                      runs with our context as its parent
-                          #   spurious flip    → fresh context, no user, no parent — or
-                          #                      an OFF inheriting an AL command's context
+                          #   spurious flip    → a context HA minted for the report (ID
+                          #                      time == last_updated) — or an OFF
+                          #                      inheriting an AL command's context
                           #   user action      → user_id set
                           #   other automation → a parent that is not ours
+                          #   anonymous caller → no user, no parent, but not minted: a
+                          #   (voice, HomeKit,   deliberate call — stop
+                          #    time trigger)
                           #
                           # so only the first two are worth re-asserting against. The
                           # "spurious flip" test is `unintentional_change` (top), applied
                           # to the live state — keep the two in lockstep, and keep this
                           # whole foreign test in lockstep with `yielded` below.
                           value_template: >-
-                            {% set c = states[target_light_id].context %}
+                            {% set s = states[target_light_id] %}
+                            {% set c = s.context %}
+                            {% set ns = namespace(t=0) %}
+                            {%- for ch in c.id[:10] | upper %}{% set ns.t = ns.t * 32 + ulid_alphabet.find(ch) %}{% endfor %}
                             {% set goal = states(grenton_switch_id)
                                  if (follow_switch and states(grenton_switch_id) in ['on', 'off'])
                                  else target_state %}
                             {{ states(target_light_id) == goal or repeat.index >= 5 or
                                (c.id != context.id and c.parent_id != context.id and
                                 not (c.user_id is none and
-                                     (c.parent_id is none or
+                                     ((c.parent_id is none and
+                                       ((s.last_updated.timestamp() * 1000) | int - ns.t) | abs <= 1) or
                                       (is_state(target_light_id, 'off') and
                                        al_context_marker in c.id)))) }}
               # ── Sync ─────────────────────────────────────────────────────────
@@ -1125,10 +1201,14 @@ action:
               # the user's press stands.
               - variables:
                   yielded: >-
-                    {% set c = states[target_light_id].context %}
+                    {% set s = states[target_light_id] %}
+                    {% set c = s.context %}
+                    {% set ns = namespace(t=0) %}
+                    {%- for ch in c.id[:10] | upper %}{% set ns.t = ns.t * 32 + ulid_alphabet.find(ch) %}{% endfor %}
                     {{ c.id != context.id and c.parent_id != context.id and
                        not (c.user_id is none and
-                            (c.parent_id is none or
+                            ((c.parent_id is none and
+                              ((s.last_updated.timestamp() * 1000) | int - ns.t) | abs <= 1) or
                              (is_state(target_light_id, 'off') and
                               al_context_marker in c.id))) }}
                   sync_to: >-
