@@ -21,7 +21,12 @@ blueprint:
     satellites, HomeKit Bridge, time-triggered automations). Two inherited contexts
     still count as the device: an off within HA's ~5 s context window after an
     Adaptive Lighting command (AL never turns a light off), and an off in the same
-    context that just turned the light on (one command cannot mean both).
+    context that just turned the light on (one command cannot mean both). A self-off
+    that lands while another run of this automation is still deciding is caught the
+    same way instead of being synced to the switch. Because a fixture can also go dark
+    without the group ever reading OFF (a lost report, or only some fixtures dropping),
+    3 s after every Adaptive Lighting colour change the light is sent one bare turn-on
+    while the switch is ON: lit fixtures do not change, dark ones come back.
     On a plain Home Assistant restart the lights never lost power, so priming only
     makes a Zigbee group flap; with an optional host-boot sensor the recovery path
     primes on HA start only when the host itself has just booted. The restore waits
@@ -413,11 +418,65 @@ trigger:
     id: "light_low"
     for: "00:00:03"
 
+  # The light's colour temperature changed and held for 3 s — in practice an Adaptive
+  # Lighting adapt that sent moveToColorTemp, the command after which these TS0502B
+  # bulbs switch themselves off at the end of the transition. Feeds only the AL
+  # re-assert step at the top of the action; no branch below claims it. The 3 s
+  # `for` puts the re-assert after AL's transition (1 s on every profile) has ended.
+  - platform: state
+    entity_id: !input target_light
+    attribute: color_temp_kelvin
+    id: "light_ct"
+    for: "00:00:03"
+
   - platform: homeassistant
     event: start
     id: "ha_start"
 
 action:
+  # ─────────────────────────────────────────────────────────────────────────
+  # RE-ASSERT AFTER AN ADAPTIVE LIGHTING COLOUR CHANGE (2026-11-19).
+  #
+  # The firmware self-off after moveToColorTemp is not always visible to HA. With
+  # the Z2M groups on off_state: all_members_off (since 2026-11-19), the group reads
+  # OFF only when EVERY member reports OFF, so a fixture whose OFF report is lost —
+  # or a partial drop where some fixtures stay lit — leaves the group ON while the
+  # room is (partly) dark, and the spurious-firmware-off branch never fires. Nothing
+  # corrects it later: the fixtures' periodic messages are Tuya genBasic heartbeats
+  # (appVersion, 65506/65508) that carry no onOff, and Z2M only republishes its cache
+  # on them. Measured 2026-11-19 with Z2M at debug level.
+  #
+  # So 3 s after every AL colour change, with the switch ON and the light ON, send
+  # one BARE light.turn_on to the group. Measured on living_room_track: Z2M turns a
+  # bare {"state":"ON"} into ONE groupcast genLevelCtrl.moveToLevelWithOnOff(level=
+  # <cached group brightness>, transtime 0) — the same command AL itself sends on
+  # every brightness adapt, which has never provoked a self-off. A lit fixture does
+  # not change; a fixture switched off (spot_1 turned off by unicast, group still ON
+  # in HA) came back at the right level (read back: onOff 1, currentLevel 207) — and
+  # reported nothing on its own, so this cannot be detected, only re-asserted.
+  #
+  # Gated on AL's context marker in the triggering state, so a user's or the device's
+  # own colour change does nothing. Bare (no brightness, colour or transition): AL's
+  # intercept skips lights that are already ON, and its manual-control test counts
+  # only brightness/colour/effect, so this neither gets adapted nor latches AL
+  # (checked in AL's switch.py). Not inside the choose below, so the run ends in
+  # milliseconds and holds the mode:single slot no longer than any trigger does.
+  # Assumes AL's transition is under 3 s; a longer one would be cut short here.
+  # ─────────────────────────────────────────────────────────────────────────
+  - if:
+      - condition: trigger
+        id: "light_ct"
+      - condition: template
+        value_template: >-
+          {{ trigger.to_state.state == 'on'
+             and al_context_marker in trigger.to_state.context.id
+             and is_state(target_light_id, 'on')
+             and is_state(grenton_switch_id, 'on') }}
+    then:
+      - service: light.turn_on
+        target:
+          entity_id: !input target_light
+
   - choose:
       # ─────────────────────────────────────────────────────────────────────────
       # SCENARIO A: user action from the Grenton side → drive the light to match,
@@ -1182,6 +1241,44 @@ action:
                                        ((s.last_updated.timestamp() * 1000) | int - ns.t) | abs <= 1) or
                                       (is_state(target_light_id, 'off') and
                                        al_context_marker in c.id)))) }}
+              # ── Missed self-off (observe) ────────────────────────────────────
+              # The light went OFF while this run held the mode:single slot, so that
+              # off's own light_changed was dropped and the spurious-firmware-off
+              # branch never saw it. The sync below would read it as the light's truth:
+              # living_room_track 2026-11-19 16:27:41, an ON echo of the branch's
+              # re-drive started this run, a late member OFF in the same context
+              # landed 41 ms later, and 1 s on the switch was synced OFF and the store
+              # saved {"state":"off"}. off_state: all_members_off makes a lone late
+              # member harmless, but the all-member post-turn-on drop (1.08 s after
+              # an ON that same minute) can still land inside the 1 s settle.
+              #
+              # So apply `unintentional_change` to the live off, with the ON that
+              # started this run as its from_state: the three clauses of the top-level
+              # definition, inlined — keep in lockstep. Device → re-drive like the
+              # spurious-firmware-off branch (one pass; its echo starts a new run that
+              # checks again) and stop: no sync, no save. Deliberate → falls through.
+              - if:
+                  - condition: template
+                    value_template: >-
+                      {% set s = states[target_light_id] %}
+                      {% set f = trigger.to_state if trigger.to_state is defined else none %}
+                      {% set c = s.context %}
+                      {% set ns = namespace(t=0) %}
+                      {%- for ch in c.id[:10] | upper %}{% set ns.t = ns.t * 32 + ulid_alphabet.find(ch) %}{% endfor %}
+                      {{ intent == 'observe' and f is not none and f.state == 'on'
+                         and s.state == 'off' and is_state(grenton_switch_id, 'on')
+                         and ((c.user_id is none and c.parent_id is none
+                               and ((s.last_updated.timestamp() * 1000) | int - ns.t) | abs <= 1)
+                              or (c.user_id is none and al_context_marker in c.id)
+                              or (f.context.id == c.id
+                                  and (f.last_changed.timestamp() * 1000) | int >= ns.t)) }}
+                then:
+                  - service: light.turn_on
+                    target:
+                      entity_id: !input target_light
+                    data:
+                      transition: 0
+                  - stop: "Re-drove a device self-off that landed during this run"
               # ── Sync ─────────────────────────────────────────────────────────
               # observe → the switch follows the light (the light is the truth).
               # restore → the switch follows target_state, NEVER the momentary light.
