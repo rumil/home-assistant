@@ -26,7 +26,9 @@ blueprint:
     same way instead of being synced to the switch. Because a fixture can also go dark
     without the group ever reading OFF (a lost report, or only some fixtures dropping),
     3 s after every Adaptive Lighting colour change the light is sent one bare turn-on
-    while the switch is ON: lit fixtures do not change, dark ones come back.
+    while the switch is ON: lit fixtures do not change, dark ones come back. Optionally
+    the same happens 5 s after every turn-on and at the end of a restore that ends ON,
+    for fixtures that drop right after being switched on.
     On a plain Home Assistant restart the lights never lost power, so priming only
     makes a Zigbee group flap; with an optional host-boot sensor the recovery path
     primes on HA start only when the host itself has just booted. The restore waits
@@ -229,9 +231,25 @@ blueprint:
         is checked with one ON at the firmware boot level (the glow the bulbs already
         show after a power cut) and then switched off, so there is no bright flash at
         night. The bulbs' fragile first on-cycle is then left to the next turn-on,
-        where the spurious-off re-drive covers it;
+        where the spurious-off re-drive covers it when the light reports the drop
+        (enable "Re-assert after turn-on" for lights that may not);
         (4) the recovery holds until the light has reported nothing for at least 6 s,
         so a late echo of its own commands cannot be mistaken for a device report.
+      default: false
+      selector:
+        boolean: {}
+    reassert_after_turn_on:
+      name: Re-assert after turn-on (optional)
+      description: >
+        Off keeps the previous behaviour. For lights (typically Zigbee2MQTT groups)
+        whose fixtures can switch themselves off a few seconds after a turn-on without
+        the light entity ever reading OFF — a lost or late member report, or only some
+        fixtures dropping — so nothing in Home Assistant can see the room go dark.
+        When on, 5 s after the light turns on, and at the end of a restore that leaves
+        it on, the light is sent one bare turn-on (no brightness, colour or transition)
+        while both it and the switch are still ON. Fixtures that are lit do not change;
+        dark ones come back at the light's current level, so there is no flash. An off
+        within those 5 s cancels it.
       default: false
       selector:
         boolean: {}
@@ -249,6 +267,7 @@ variables:
   host_boot_window: !input host_boot_window
   settle_time: !input settle_time
   quiet_recovery: !input quiet_recovery
+  reassert_after_turn_on: !input reassert_after_turn_on
   # Whether a persistent state store is configured.
   has_store: "{{ state_store_id not in ['', 'unknown', 'unavailable', none] }}"
   # Whether an Adaptive Lighting switch is configured for this light. When true, the
@@ -429,6 +448,18 @@ trigger:
     id: "light_ct"
     for: "00:00:03"
 
+  # The light turned on and stayed on for 5 s. Feeds only the post-turn-on re-assert
+  # at the top of the action (reassert_after_turn_on); no branch below claims it. An
+  # off inside the 5 s cancels it; attribute-only changes (the brightness ramp, AL's
+  # adapt) do not. 5 s, not light_ct's 3 s: the post-turn-on self-off lands ~2–3 s
+  # after the command (2026-11-22), and a re-assert that arrives before it is wasted.
+  - platform: state
+    entity_id: !input target_light
+    from: "off"
+    to: "on"
+    for: "00:00:05"
+    id: "light_on_held"
+
   - platform: homeassistant
     event: start
     id: "ha_start"
@@ -462,14 +493,35 @@ action:
   # (checked in AL's switch.py). Not inside the choose below, so the run ends in
   # milliseconds and holds the mode:single slot no longer than any trigger does.
   # Assumes AL's transition is under 3 s; a longer one would be cut short here.
+  #
+  # RE-ASSERT AFTER A TURN-ON (light_on_held, opt-in via reassert_after_turn_on,
+  # 2026-11-22). The same blind re-assert, 5 s after every off→on, whoever turned
+  # the light on. A turn-on reaches Z2M as ON + brightness + colour with AL's 1 s
+  # initial_transition, i.e. moveToLevelWithOnOff then moveToColorTemp — the same
+  # provocation — and the fixtures self-off ~2–3 s later. living_room_track,
+  # 13:32–13:39, right after a Z2M restart (the documented post-re-establishment
+  # fragility): 4 of 4 turn-ons went dark; in 3 of them late/retried member reports
+  # (spot_2 and spot_6 claimed ON at +12 s while dark) kept the all_members_off group
+  # ON, so no off ever reached HA and the room stayed dark. The light_ct path above
+  # fired 3 s after each of those turn-ons (color_temp_kelvin goes none → value on
+  # every off→on) but was gated out: a turn-on's state carries its caller's context
+  # (Scenario A's run, the dashboard user) — AL's intercept rewrites the call's data,
+  # not its context. Not merged into light_ct by dropping that gate: 3 s is too close
+  # to the drop. Recovery runs hold the slot past 5 s, so this trigger is dropped
+  # there; the pipeline's restore re-asserts at its own end instead (see there).
+  #
+  # Both cases gate on the LIVE light and switch being ON, so an off inside the
+  # window (a wrong wall press corrected) is never undone.
   # ─────────────────────────────────────────────────────────────────────────
   - if:
       - condition: trigger
-        id: "light_ct"
+        id: ["light_ct", "light_on_held"]
       - condition: template
         value_template: >-
-          {{ trigger.to_state.state == 'on'
-             and al_context_marker in trigger.to_state.context.id
+          {{ ((trigger.id == 'light_ct'
+               and trigger.to_state.state == 'on'
+               and al_context_marker in trigger.to_state.context.id)
+              or (trigger.id == 'light_on_held' and reassert_after_turn_on))
              and is_state(target_light_id, 'on')
              and is_state(grenton_switch_id, 'on') }}
     then:
@@ -1382,6 +1434,29 @@ action:
                       entity_id: "{{ state_store_id }}"
                     data:
                       value: "{{ snapshot_json | trim }}"
+              # ── Re-assert a restore that ended ON (reassert_after_turn_on) ───
+              # The restore's turn-on is exactly the fragile first turn-on after the
+              # Zigbee link came back, and with quiet_recovery outside the host-boot
+              # window it is not primed. If fixtures drop after it but the group keeps
+              # reading ON (all_members_off, a lost member report), the assert loop is
+              # satisfied and the room stays dark. The light_on_held re-assert at the
+              # top cannot cover this: it fires 5 s after the restore's off→on, while
+              # this run still holds the mode:single slot, and is dropped. So send the
+              # same bare turn-on here. When the restore held, the assert loop's last
+              # pass already waited ≥ 5 s after its last drive (1 s + the 4 s watch
+              # timing out, then the settle), so this lands after the drop. Gated on the live switch too, i.e. after the
+              # sync: a restore the user overrode to OFF is left alone. Before the AL
+              # release, so AL's re-adapt (and its own light_ct re-assert) comes after.
+              - if:
+                  - condition: template
+                    value_template: >-
+                      {{ reassert_after_turn_on and intent == 'restore'
+                         and is_state(target_light_id, 'on')
+                         and is_state(grenton_switch_id, 'on') }}
+                then:
+                  - service: light.turn_on
+                    target:
+                      entity_id: !input target_light
               # ── Hand back to Adaptive Lighting ───────────────────────────────
               # Only when an AL switch is configured for this light. Every attributed
               # turn_on this branch issued — the prime loop, the restore snapshot, the
