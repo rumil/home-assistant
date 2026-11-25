@@ -21,14 +21,22 @@ blueprint:
     satellites, HomeKit Bridge, time-triggered automations). Two inherited contexts
     still count as the device: an off within HA's ~5 s context window after an
     Adaptive Lighting command (AL never turns a light off), and an off in the same
-    context that just turned the light on (one command cannot mean both). A self-off
-    that lands while another run of this automation is still deciding is caught the
-    same way instead of being synced to the switch. Because a fixture can also go dark
+    context that just turned the light on (one command cannot mean both). The mirror
+    image is handled too: a light that turns itself back ON in the very context that
+    just switched it off (a late fixture report) while the switch is OFF is switched off
+    again instead of turning the switch on. A self-off or such a late ON that lands
+    while another run of this automation is still deciding is caught the same way
+    instead of being synced to the switch. Because a fixture can also go dark
     without the group ever reading OFF (a lost report, or only some fixtures dropping),
     3 s after every Adaptive Lighting colour change the light is sent one bare turn-on
     while the switch is ON: lit fixtures do not change, dark ones come back. Optionally
     the same happens 5 s after every turn-on and at the end of a restore that ends ON,
-    for fixtures that drop right after being switched on.
+    for fixtures that drop right after being switched on, and a bare turn-off is sent
+    again 30 s and 2 min after every turn-off, for fixtures that missed it (a group's
+    OFF right after a command is the bridge's own assumption, not their answer).
+    When the Grenton switch comes back from unavailable (a controller restart or
+    outage), the switch follows the light, unless the light is showing its firmware
+    boot glow; then the saved state is restored and the switch follows that.
     On a plain Home Assistant restart the lights never lost power, so priming only
     makes a Zigbee group flap; with an optional host-boot sensor the recovery path
     primes on HA start only when the host itself has just booted. The restore waits
@@ -239,17 +247,23 @@ blueprint:
       selector:
         boolean: {}
     reassert_after_turn_on:
-      name: Re-assert after turn-on (optional)
+      # The key keeps its original name so existing instances stay valid; it now
+      # covers turn-off as well.
+      name: Re-assert after turn-on and turn-off (optional)
       description: >
         Off keeps the previous behaviour. For lights (typically Zigbee2MQTT groups)
-        whose fixtures can switch themselves off a few seconds after a turn-on without
-        the light entity ever reading OFF — a lost or late member report, or only some
-        fixtures dropping — so nothing in Home Assistant can see the room go dark.
-        When on, 5 s after the light turns on, and at the end of a restore that leaves
-        it on, the light is sent one bare turn-on (no brightness, colour or transition)
+        whose fixtures can end up in the wrong state without the light entity ever
+        showing it — a lost or late member report, a fixture that missed a group
+        command, or only some fixtures dropping.
+        (1) 5 s after the light turns on, and at the end of a restore that leaves it
+        on, the light is sent one bare turn-on (no brightness, colour or transition)
         while both it and the switch are still ON. Fixtures that are lit do not change;
         dark ones come back at the light's current level, so there is no flash. An off
         within those 5 s cancels it.
+        (2) 30 s and 2 min after the light turns off, while both it and the switch are
+        still OFF, it is sent one bare turn-off. Fixtures that are off do not change;
+        one still glowing (e.g. it rebooted after the last command) goes off. An on
+        meanwhile cancels it.
       default: false
       selector:
         boolean: {}
@@ -357,6 +371,34 @@ variables:
            and f.context.id == c.id
            and (f.last_changed.timestamp() * 1000) | int >= ns.t) }}
     {%- endif %}
+  # An OFF reverted by the device: the light went OFF → ON, the ON carries the very
+  # context that switched it off, and the light went off after that context was
+  # created — i.e. the mirror image of clause 3 above. One command switches a light
+  # one way; a context that darkened it cannot also have meant it lit seconds later.
+  # It is a late member report (the fade's tail, a retried report) that HA wrote
+  # inside its 5 s context-reuse window, so it inherits the off's context — including
+  # a user_id when the off came from the HA app, which made it look like a user's
+  # turn-on. office_track 2026-11-24 23:29:11 → 15.90 (trace bd11f37f): an HA-app off,
+  # then office_track_linear_3 (weak link) reported ON at brightness 1, the group
+  # (all_members_off) read ON in the off's context, the pipeline yielded to it and
+  # turned switch.office_ceiling ON — the room lit again. Kept out of
+  # `unintentional_change` on purpose: that is about offs and boots; this is claimed
+  # by its own branch before the pipeline. Not covered: one script run that turns a
+  # light off and back on within 5 s while the switch is off is read as the device
+  # and switched off again (the mirror of clause 3's limit).
+  off_reverted: >-
+    {%- set s = trigger.to_state if trigger.to_state is defined else none %}
+    {%- set f = trigger.from_state if trigger.from_state is defined else none %}
+    {%- if s is none or f is none %}{{ false }}{% else %}
+    {%- set ns = namespace(t=0) %}
+    {%- for ch in s.context.id[:10] | upper %}{% set ns.t = ns.t * 32 + ulid_alphabet.find(ch) %}{% endfor %}
+    {{- s.state == 'on' and f.state == 'off' and f.context.id == s.context.id
+        and (f.last_changed.timestamp() * 1000) | int >= ns.t }}
+    {%- endif %}
+  # When this run started (epoch seconds). A Grenton switch whose last_changed is later
+  # changed while this run held the mode:single slot, so its own grenton_changed was
+  # dropped — see "dropped press" in Scenario A and before the pipeline's sync.
+  run_started: "{{ now().timestamp() }}"
   # The saved snapshot (parsed from the store), read once at run start. Empty dict
   # when no store is configured or the store holds no valid JSON yet.
   saved: >-
@@ -460,6 +502,23 @@ trigger:
     for: "00:00:05"
     id: "light_on_held"
 
+  # The light turned off and stayed off for 30 s / 2 min. Feeds only the post-turn-off
+  # re-assert at the top of the action (reassert_after_turn_on); no branch below
+  # claims it. An on meanwhile cancels it; attribute-only reports do not. Two
+  # triggers, one id: a fixture still rebooting or rejoining at the first pass gets
+  # the second. 2026-11-24: the fixtures' first reports after a power cycle spread
+  # over ~20 s and route errors went on ~60 s after the last OFF.
+  - platform: state
+    entity_id: !input target_light
+    to: "off"
+    for: "00:00:30"
+    id: "light_off_held"
+  - platform: state
+    entity_id: !input target_light
+    to: "off"
+    for: "00:02:00"
+    id: "light_off_held"
+
   - platform: homeassistant
     event: start
     id: "ha_start"
@@ -512,22 +571,52 @@ action:
   #
   # Both cases gate on the LIVE light and switch being ON, so an off inside the
   # window (a wrong wall press corrected) is never undone.
+  #
+  # RE-ASSERT AFTER A TURN-OFF (light_off_held, same opt-in, 2026-11-25). The
+  # inverse blind spot: a fixture that missed an OFF stays lit while the group reads
+  # OFF. A Z2M group reading OFF right after a group command proves nothing — Z2M
+  # publishes every member OFF optimistically the moment it sends the command, with no
+  # fixture answering (Z2M log, 2026-11-24 23:17:42/49/50). That night a Grenton CLU
+  # restart power-cycled three track groups; the self-boot restore sent its turn_offs
+  # while fixtures were still booting and rejoining (first reports spread over ~20 s,
+  # route errors until ~60 s later), the groups read OFF, and fixtures glowed at the
+  # boot level for 11 minutes. So 30 s and 2 min after every off, with the light and
+  # the switch both OFF, send one bare turn_off: an off fixture does not change, a lit
+  # one goes off. Checked 2026-11-25: Z2M does send an OFF to a group it already reads
+  # off (the optimistic member publish followed at once) — the July 2026 belief that it
+  # suppresses it does not hold. A separate trigger rather than a tail inside the
+  # restore, so no run holds the mode:single slot for it and wall presses are never
+  # dropped on its account; it also covers fixtures that miss an ordinary off.
+  # Both offs gate on the LIVE light and switch, so a turn-on meanwhile is never undone.
   # ─────────────────────────────────────────────────────────────────────────
-  - if:
-      - condition: trigger
-        id: ["light_ct", "light_on_held"]
-      - condition: template
-        value_template: >-
-          {{ ((trigger.id == 'light_ct'
-               and trigger.to_state.state == 'on'
-               and al_context_marker in trigger.to_state.context.id)
-              or (trigger.id == 'light_on_held' and reassert_after_turn_on))
-             and is_state(target_light_id, 'on')
-             and is_state(grenton_switch_id, 'on') }}
-    then:
-      - service: light.turn_on
-        target:
-          entity_id: !input target_light
+  - choose:
+      - conditions:
+          - condition: trigger
+            id: ["light_ct", "light_on_held"]
+          - condition: template
+            value_template: >-
+              {{ ((trigger.id == 'light_ct'
+                   and trigger.to_state.state == 'on'
+                   and al_context_marker in trigger.to_state.context.id)
+                  or (trigger.id == 'light_on_held' and reassert_after_turn_on))
+                 and is_state(target_light_id, 'on')
+                 and is_state(grenton_switch_id, 'on') }}
+        sequence:
+          - service: light.turn_on
+            target:
+              entity_id: !input target_light
+      - conditions:
+          - condition: trigger
+            id: "light_off_held"
+          - condition: template
+            value_template: >-
+              {{ reassert_after_turn_on
+                 and is_state(target_light_id, 'off')
+                 and is_state(grenton_switch_id, 'off') }}
+        sequence:
+          - service: light.turn_off
+            target:
+              entity_id: !input target_light
 
   - choose:
       # ─────────────────────────────────────────────────────────────────────────
@@ -631,6 +720,44 @@ action:
                       entity_id: "{{ state_store_id }}"
                     data:
                       value: "{{ snapshot_json | trim }}"
+          # ── Dropped press (2026-11-25) ────────────────────────────────────────
+          # With a store, the save above holds the mode:single slot ~1.5–3 s after
+          # every press (two waits and a 1 s settle), so a second press inside that
+          # window has its grenton_changed dropped: wall ON then quickly OFF left the
+          # light ON with the switch OFF (bedroom 2026-09-19, a press 1 s after the
+          # previous one). The switch STATE still updates, so: if the switch changed
+          # after this run started and now disagrees with the light, that press is the
+          # user's intent — drive the light to the live switch, bare, as above. Last,
+          # so the slot is freed at once and the light's echo starts a normal run that
+          # saves the new state (it overwrites the snapshot this run just took).
+          # Never fires on the run's own press (it changed before run_started), and is
+          # a no-op without a store (the run ends milliseconds after the drive).
+          # Not covered: a Grenton CLU restart whose unavailable → boot default lands
+          # inside this ~3 s window reads as a press — needs a restart within seconds
+          # of a wall press. Same rule, same expression, before the pipeline's sync —
+          # keep in lockstep.
+          - if:
+              - condition: template
+                value_template: >-
+                  {{ states(grenton_switch_id) in ['on', 'off']
+                     and states(target_light_id) in ['on', 'off']
+                     and states(grenton_switch_id) != states(target_light_id)
+                     and as_timestamp(states[grenton_switch_id].last_changed)
+                           > run_started | float }}
+            then:
+              - choose:
+                  - conditions:
+                      - condition: state
+                        entity_id: !input grenton_switch
+                        state: "on"
+                    sequence:
+                      - service: light.turn_on
+                        target:
+                          entity_id: !input target_light
+                default:
+                  - service: light.turn_off
+                    target:
+                      entity_id: !input target_light
 
       # ─────────────────────────────────────────────────────────────────────────
       # SPURIOUS FIRMWARE OFF: the light reported itself OFF with no one behind it
@@ -750,6 +877,68 @@ action:
                                   al_context_marker in c.id)))) }}
 
       # ─────────────────────────────────────────────────────────────────────────
+      # REVERTED OFF: the light came back ON in the very context that switched it off
+      # (`off_reverted`, see there) while the Grenton switch is OFF. The mirror image
+      # of the spurious-firmware-off branch above, with the same loop: re-drive the
+      # light to the LIVE switch until it holds, do NOT sync the switch on and do not
+      # save. Left to the pipeline, the ON carries the off's context — a user_id when
+      # the off came from the HA app, a parent when it came via a wall press — so it is
+      # taken for a deliberate turn-on: the switch is turned ON and the room lights
+      # again (office 2026-11-24 23:29:15). Placed before the pipeline (first match
+      # wins), gated only on trigger/context/switch, so every instance gets it.
+      #
+      # A wall press meanwhile is honoured: each pass re-reads the live switch and
+      # drives the light to it (bare, like Scenario A). The loop stops on a foreign
+      # change, exactly like the spurious-off loop. A deliberate turn-on never matches
+      # here: every service call brings a new context, so only a report inside the
+      # off's own 5 s window can carry it.
+      # ─────────────────────────────────────────────────────────────────────────
+      - conditions:
+          - condition: trigger
+            id: "light_changed"
+          - condition: template
+            value_template: "{{ off_reverted and is_state(grenton_switch_id, 'off') }}"
+        sequence:
+          - repeat:
+              sequence:
+                - choose:
+                    - conditions:
+                        - condition: template
+                          value_template: >-
+                            {{ is_state(grenton_switch_id, 'off')
+                               and not is_state(target_light_id, 'off') }}
+                      sequence:
+                        - service: light.turn_off
+                          target:
+                            entity_id: !input target_light
+                    - conditions:
+                        - condition: template
+                          value_template: >-
+                            {{ is_state(grenton_switch_id, 'on')
+                               and not is_state(target_light_id, 'on') }}
+                      sequence:
+                        - service: light.turn_on
+                          target:
+                            entity_id: !input target_light
+                - delay: "00:00:01"
+              until:
+                - condition: template
+                  # Same stop rule as the spurious-off loop — keep in lockstep.
+                  value_template: >-
+                    {% set s = states[target_light_id] %}
+                    {% set c = s.context %}
+                    {% set ns = namespace(t=0) %}
+                    {%- for ch in c.id[:10] | upper %}{% set ns.t = ns.t * 32 + ulid_alphabet.find(ch) %}{% endfor %}
+                    {{ states(target_light_id) == states(grenton_switch_id)
+                       or repeat.index >= 3
+                       or (c.id != context.id and
+                           not (c.user_id is none and
+                                ((c.parent_id is none and
+                                  ((s.last_updated.timestamp() * 1000) | int - ns.t) | abs <= 1) or
+                                 (is_state(target_light_id, 'off') and
+                                  al_context_marker in c.id)))) }}
+
+      # ─────────────────────────────────────────────────────────────────────────
       # LIGHT-SIDE PIPELINE: every event that arrives from the light, plus HA start.
       #
       # One pipeline, one branch point. Recovery, self-boot and ordinary user actions
@@ -769,7 +958,23 @@ action:
       #
       # A device-originated `light_changed` to OFF while the switch is ON is claimed by
       # the spurious-firmware-off branch above (first match wins) and never reaches
-      # here; every other light_changed does.
+      # here, nor does an OFF reverted with the switch OFF (the reverted-off branch);
+      # every other light_changed does.
+      #
+      # `grenton_recovered` (the switch back from unavailable) joins here on
+      # restore_previous instances (2026-11-25). Since integration 0.5.0 a Grenton
+      # CLU restart reaches HA as unavailable → <boot default>, so the boot defaults
+      # land here instead of in Scenario A (2026-11-24 23:17:45: every User Feature
+      # reported off at once and Scenario A switched every LED strip off). Normally
+      # it is observe — the switch follows the light and nothing is commanded, as in
+      # the catch-all. But the same restart can power-cycle the track fixtures (it did
+      # that night), and syncing the switch to a light showing its boot glow would turn
+      # the switch ON. So when the light is ON at the boot level with a context HA
+      # minted for a device report, it is a recovery: the store is restored and the
+      # switch follows that. The store is not used otherwise: it can lag the light
+      # (it is written only on the observe path), and a restore re-sends brightness and
+      # colour to a light that is already right. Priming follows light_recovered's
+      # rules (with quiet_recovery, only inside the host-boot window).
       # ─────────────────────────────────────────────────────────────────────────
       - conditions:
           - condition: trigger
@@ -778,6 +983,7 @@ action:
               - "light_low"
               - "light_recovered"
               - "ha_start"
+              - "grenton_recovered"
           - condition: template
             value_template: "{{ post_outage_behavior == 'restore_previous' and has_store }}"
         sequence:
@@ -838,7 +1044,23 @@ action:
                   # into it, so `context.user_id is none` is unconditionally true and is
                   # dead code. The same construction is why a trace's `context.parent_id`
                   # shows the TRIGGERING state's context ID, not that state's parent.
-                  device_originated: "{{ unintentional_change }}"
+                  #
+                  # Only for triggers whose states are the LIGHT's: on grenton_recovered
+                  # the trigger states are the switch's, and on ha_start there are none.
+                  device_originated: >-
+                    {{ unintentional_change
+                       if trigger.id in ['light_changed', 'light_low', 'light_recovered']
+                       else false }}
+                  # The light's CURRENT state was written by a device report: HA minted
+                  # its context (clause 1 of `unintentional_change`, on the live state).
+                  # Used only to recognise a boot glow on grenton_recovered.
+                  live_device: >-
+                    {% set s = states[target_light_id] %}
+                    {% set c = s.context %}
+                    {% set ns = namespace(t=0) %}
+                    {%- for ch in c.id[:10] | upper %}{% set ns.t = ns.t * 32 + ulid_alphabet.find(ch) %}{% endfor %}
+                    {{ c.user_id is none and c.parent_id is none
+                       and ((s.last_updated.timestamp() * 1000) | int - ns.t) | abs <= 1 }}
                   # On at a KNOWN brightness at or below the boot threshold.
                   at_boot_level: >-
                     {{ recovery_brightness_threshold | int > 0 and cur_on and cur_bri_known
@@ -848,7 +1070,12 @@ action:
                   dropped_into_boot: >-
                     {{ at_boot_level and
                        (not from_on or from_bri > recovery_brightness_threshold | int) }}
-                  is_recovery: "{{ trigger.id in ['light_recovered', 'ha_start'] }}"
+                  # grenton_recovered is a recovery only when the light shows a boot
+                  # glow nothing in HA asked for (see the pipeline header); otherwise it
+                  # is observe and the switch simply follows the light.
+                  is_recovery: >-
+                    {{ trigger.id in ['light_recovered', 'ha_start']
+                       or (trigger.id == 'grenton_recovered' and at_boot_level and live_device) }}
                   # SELF-BOOT: the bulb powered itself up. It went off → on, came up at
                   # the firmware boot level, and nothing in HA asked for it. The light
                   # never went unavailable, so none of the recovery triggers fired — but
@@ -904,9 +1131,11 @@ action:
                   boot_recent: >-
                     {{ host_boot_ts is not none and
                        now().timestamp() - host_boot_ts <= host_boot_window | float(10) * 60 }}
+                  # grenton_recovered (a boot glow found when the Grenton switch comes
+                  # back, see the pipeline header) is gated like light_recovered.
                   prime_allowed: >-
-                    {{ trigger.id not in (['ha_start', 'light_recovered'] if quiet_recovery
-                                          else ['ha_start'])
+                    {{ trigger.id not in (['ha_start', 'light_recovered', 'grenton_recovered']
+                                          if quiet_recovery else ['ha_start'])
                        or host_boot_ts is none or boot_recent }}
                   # Set by the wait-for-Zigbee loop below when the user presses the wall
                   # switch while Zigbee is not delivering: from then on the live switch,
@@ -1317,7 +1546,8 @@ action:
                       {% set c = s.context %}
                       {% set ns = namespace(t=0) %}
                       {%- for ch in c.id[:10] | upper %}{% set ns.t = ns.t * 32 + ulid_alphabet.find(ch) %}{% endfor %}
-                      {{ intent == 'observe' and f is not none and f.state == 'on'
+                      {{ intent == 'observe' and trigger.id in ['light_changed', 'light_low']
+                         and f is not none and f.state == 'on'
                          and s.state == 'off' and is_state(grenton_switch_id, 'on')
                          and ((c.user_id is none and c.parent_id is none
                                and ((s.last_updated.timestamp() * 1000) | int - ns.t) | abs <= 1)
@@ -1331,6 +1561,70 @@ action:
                     data:
                       transition: 0
                   - stop: "Re-drove a device self-off that landed during this run"
+              # ── Missed reverted off (observe) ────────────────────────────────
+              # The mirror image: this run started on an OFF, and within its settle the
+              # light came back ON in that off's own context (`off_reverted`, inlined
+              # with the OFF that started this run as from_state — keep in lockstep).
+              # That ON's own light_changed was dropped by mode:single, so the
+              # reverted-off branch never saw it, and the sync below would read it as
+              # the light's truth (the switch stays/turns ON, a 1 % brightness is saved
+              # as a deliberate dim). The off is the intent: switch the light off again
+              # and stop — no switch condition, as the switch may not have been synced
+              # off yet; the echo starts a new run that syncs the switch and saves.
+              - if:
+                  - condition: template
+                    value_template: >-
+                      {% set s = states[target_light_id] %}
+                      {% set f = trigger.to_state if trigger.to_state is defined else none %}
+                      {% set ns = namespace(t=0) %}
+                      {%- for ch in s.context.id[:10] | upper %}{% set ns.t = ns.t * 32 + ulid_alphabet.find(ch) %}{% endfor %}
+                      {{ intent == 'observe' and trigger.id == 'light_changed'
+                         and f is not none and f.state == 'off' and s.state == 'on'
+                         and f.context.id == s.context.id
+                         and (f.last_changed.timestamp() * 1000) | int >= ns.t }}
+                then:
+                  - service: light.turn_off
+                    target:
+                      entity_id: !input target_light
+                  - stop: "Switched off again a light that came back on in its off's context"
+              # ── Dropped press (observe, 2026-11-25) ──────────────────────────
+              # A wall press that landed while this run held the slot had its
+              # grenton_changed dropped, and the sync below would then put the switch
+              # back to the light — the press undone. Typical: wall ON, then OFF ~3–4 s
+              # later, while the light_low run that follows every turn-on (3 s after
+              # the brightness settles, ~1 s long) is deciding. If the switch changed
+              # after this run started and disagrees with the light, the press is the
+              # intent: drive the light to the live switch (bare, like Scenario A) and
+              # stop — no sync, no save; the light's echo starts a normal run that
+              # syncs and saves. Observe only: a restore keeps syncing the switch to its
+              # target (a press during a restore's prime/assert is still not covered),
+              # because the switch change most likely to land inside a restore is a
+              # Grenton CLU restart's boot default, which must not drive the light.
+              # Same rule, same expression, at the end of Scenario A — keep in lockstep.
+              - if:
+                  - condition: template
+                    value_template: >-
+                      {{ intent == 'observe'
+                         and states(grenton_switch_id) in ['on', 'off']
+                         and states(target_light_id) in ['on', 'off']
+                         and states(grenton_switch_id) != states(target_light_id)
+                         and as_timestamp(states[grenton_switch_id].last_changed)
+                               > run_started | float }}
+                then:
+                  - choose:
+                      - conditions:
+                          - condition: state
+                            entity_id: !input grenton_switch
+                            state: "on"
+                        sequence:
+                          - service: light.turn_on
+                            target:
+                              entity_id: !input target_light
+                    default:
+                      - service: light.turn_off
+                        target:
+                          entity_id: !input target_light
+                  - stop: "Drove the light to a wall press that landed during this run"
               # ── Sync ─────────────────────────────────────────────────────────
               # observe → the switch follows the light (the light is the truth).
               # restore → the switch follows target_state, NEVER the momentary light.
@@ -1501,10 +1795,14 @@ action:
 
       # ─────────────────────────────────────────────────────────────────────────
       # CATCH-ALL: the light is the source of truth — sync the switch to it and touch
-      # nothing else. Takes the Grenton switch's own recovery (handled nowhere else,
-      # and relevant to every instance), plus every light-side event the pipeline
-      # above did not claim: on light_source_of_truth instances, and on
-      # restore_previous instances with no state store configured.
+      # nothing else. Takes the Grenton switch's own recovery on instances without the
+      # pipeline (on restore_previous instances with a store the pipeline claims it,
+      # to tell a track's boot glow from its real state — see the pipeline header),
+      # plus every light-side event the pipeline above did not claim: on
+      # light_source_of_truth instances, and on restore_previous instances with no
+      # state store configured. A Grenton CLU restart (integration ≥ 0.5.0: unavailable
+      # → boot default) lands here on those instances, so the switch is put back to
+      # what the light shows instead of the light following the boot default.
       #
       # `light_changed` is HERE, not only in the pipeline, on purpose: the pipeline is
       # gated on `restore_previous and has_store`, so on a source-of-truth instance an
