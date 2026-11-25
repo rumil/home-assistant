@@ -34,9 +34,13 @@ blueprint:
     for fixtures that drop right after being switched on, and a bare turn-off is sent
     again 30 s and 2 min after every turn-off, for fixtures that missed it (a group's
     OFF right after a command is the bridge's own assumption, not their answer).
-    When the Grenton switch comes back from unavailable (a controller restart or
-    outage), the switch follows the light, unless the light is showing its firmware
-    boot glow; then the saved state is restored and the switch follows that.
+    When the Grenton switch comes back from unavailable, the integration's
+    restart_detected_at (Grenton ≥ 0.6.0) tells a controller restart from an outage.
+    After a restart the switch holds its boot default, so the saved on/off state is
+    restored (in full if the light shows its firmware boot glow) and the switch
+    follows it; without a state store the switch follows the light. After an outage
+    a wall press made meanwhile is honoured: the light is driven to the switch when
+    it has not changed itself since. Otherwise the switch follows the light.
     On a plain Home Assistant restart the lights never lost power, so priming only
     makes a Zigbee group flap; with an optional host-boot sensor the recovery path
     primes on HA start only when the host itself has just booted. The restore waits
@@ -267,6 +271,21 @@ blueprint:
       default: false
       selector:
         boolean: {}
+    clu_boot_sensor:
+      name: Grenton CLU last-boot sensor
+      description: >
+        The Grenton integration's (≥ 0.6.0) "Last boot" sensor of the CLU that owns
+        the switch; its restart_detected_at attribute tells a CLU restart from an
+        outage when the switch comes back from unavailable. After a restart the
+        switch holds the CLU's boot default, so the saved state is restored (or, with
+        no state store, the switch follows the light). After an outage the switch may
+        hold a wall press made meanwhile, so the light is driven to it when the light
+        itself has not changed since. Empty, or a sensor that is unavailable: the
+        switch always follows the light, as before.
+      default: sensor.grenton_clu_last_boot
+      selector:
+        entity:
+          domain: sensor
 
 variables:
   target_light_id: !input target_light
@@ -278,6 +297,7 @@ variables:
   saved_attributes: !input saved_attributes
   adaptive_lighting_switch_id: !input adaptive_lighting_switch
   host_boot_sensor_id: !input host_boot_sensor
+  clu_boot_sensor_id: !input clu_boot_sensor
   host_boot_window: !input host_boot_window
   settle_time: !input settle_time
   quiet_recovery: !input quiet_recovery
@@ -399,6 +419,53 @@ variables:
   # changed while this run held the mode:single slot, so its own grenton_changed was
   # dropped — see "dropped press" in Scenario A and before the pipeline's sync.
   run_started: "{{ now().timestamp() }}"
+  # The switch's state when this run started. The dropped-press checks need it on/off:
+  # a switch that was unavailable at run start and came back mid-run is a recovery
+  # (its own grenton_recovered dropped), not a press.
+  switch_at_start: "{{ states(grenton_switch_id) }}"
+  # ── Restart vs outage (Grenton integration ≥ 0.6.0, 2026-11-25) ─────────────
+  # grenton_recovered (unavailable → value) follows either a CLU restart — the value
+  # is the CLU's boot default — or an outage / failed renewals with no restart — the
+  # value is the CLU's real state, possibly a wall press made meanwhile. The
+  # integration's contract: restart_detected_at on the CLU's last-boot sensor is
+  # written before the first post-restart value, is never earlier than the moment
+  # the entity went unavailable, and stays older than any later unavailable period
+  # without a restart. So the CLU restarted during THIS unavailable period iff
+  # restart_detected_at >= the moment the switch went unavailable
+  # (trigger.from_state.last_changed). Use the attribute, never the sensor's state
+  # or last_changed: those are also written at HA start, integration reload, and
+  # when the CLU first answers after HA started without it. Null at startup and
+  # after a reload (a restart while HA was down goes undetected — ha_start's job).
+  clu_restarted: >-
+    {%- set rt = as_timestamp(state_attr(clu_boot_sensor_id, 'restart_detected_at'), none) %}
+    {{ trigger.id == 'grenton_recovered' and rt is not none
+       and rt >= as_timestamp(trigger.from_state.last_changed) }}
+  # A wall press made during an outage: no restart, so the switch's value is real,
+  # and it disagrees with a light that has not changed since the switch went
+  # unavailable (a light that changed meanwhile is the newer intent and wins). Taken
+  # as a press — routed to Scenario A, which drives the light to the switch.
+  # Two guards keep a restart from passing for an outage:
+  #  - the sensor must be readable: without it there is no detection at all.
+  #  - the switch must have gone unavailable more than 5 min after this automation
+  #    was loaded (`this.last_changed`: HA start, or the automation being re-enabled
+  #    or reloaded). At startup restart_detected_at is null, so a CLU that HA started
+  #    without — e.g. both re-powered after a power cut — would come back with its
+  #    boot defaults reading as an outage. Measured 2026-11-25 19:26: the Grenton
+  #    switches were written 3.5 s before the automations, so a switch that is
+  #    unavailable at startup went unavailable before `this.last_changed`.
+  # Not covered: with detection off (the CLU does not answer the uptime read) a
+  # restart reads as an outage — integration contract.
+  outage_press: >-
+    {%- set loaded = as_timestamp(this.last_changed, none)
+                     if (this is defined and this.last_changed is defined) else none %}
+    {{ trigger.id == 'grenton_recovered' and not clu_restarted
+       and states(clu_boot_sensor_id) not in ['unknown', 'unavailable']
+       and loaded is not none
+       and as_timestamp(trigger.from_state.last_changed) > loaded + 300
+       and states(grenton_switch_id) in ['on', 'off']
+       and states(target_light_id) in ['on', 'off']
+       and states(grenton_switch_id) != states(target_light_id)
+       and states[target_light_id].last_changed <= trigger.from_state.last_changed }}
   # The saved snapshot (parsed from the store), read once at run start. Empty dict
   # when no store is configured or the store holds no valid JSON yet.
   saved: >-
@@ -428,7 +495,8 @@ trigger:
       - unknown
       - unavailable
 
-  # Grenton restarted — its switch state is not reliable, light is source of truth
+  # Grenton switch back from unavailable — a CLU restart (boot default) or an outage
+  # (real value, maybe a press made meanwhile); see clu_restarted / outage_press.
   - platform: state
     entity_id: !input grenton_switch
     id: "grenton_recovered"
@@ -628,10 +696,15 @@ action:
       # press. That is the only reason A does not share the light-side pipeline
       # below; the assert loop and the save guard are deliberately identical to it
       # and must be kept in lockstep.
+      #
+      # Also takes a wall press made during a Grenton outage (`outage_press`: the
+      # switch came back from unavailable with no CLU restart, disagreeing with a
+      # light that has not changed since) — the same intent, arriving late. Every
+      # instance, store or not.
       # ─────────────────────────────────────────────────────────────────────────
       - conditions:
-          - condition: trigger
-            id: "grenton_changed"
+          - condition: template
+            value_template: "{{ trigger.id == 'grenton_changed' or outage_press }}"
         sequence:
           # Drive the light to match the switch immediately — no settle up front, so
           # a wall-switch press has no visible lag.
@@ -732,18 +805,24 @@ action:
           # saves the new state (it overwrites the snapshot this run just took).
           # Never fires on the run's own press (it changed before run_started), and is
           # a no-op without a store (the run ends milliseconds after the drive).
-          # Not covered: a Grenton CLU restart whose unavailable → boot default lands
-          # inside this ~3 s window reads as a press — needs a restart within seconds
-          # of a wall press. Same rule, same expression, before the pipeline's sync —
-          # keep in lockstep.
+          # A Grenton CLU restart whose unavailable → boot default lands inside this
+          # window is not a press: the integration writes restart_detected_at before
+          # the boot default, and never earlier than the unavailable moment, which
+          # for a switch available at run start is after run_started. Nor is a
+          # switch that was unavailable at run start (switch_at_start). With
+          # detection off a restart still reads as a press (integration contract).
+          # Same rule, same expression, before the pipeline's sync — keep in lockstep.
           - if:
               - condition: template
                 value_template: >-
-                  {{ states(grenton_switch_id) in ['on', 'off']
+                  {{ switch_at_start in ['on', 'off']
+                     and states(grenton_switch_id) in ['on', 'off']
                      and states(target_light_id) in ['on', 'off']
                      and states(grenton_switch_id) != states(target_light_id)
                      and as_timestamp(states[grenton_switch_id].last_changed)
-                           > run_started | float }}
+                           > run_started | float
+                     and (as_timestamp(state_attr(clu_boot_sensor_id, 'restart_detected_at'), none)
+                          or 0) < run_started | float }}
             then:
               - choose:
                   - conditions:
@@ -970,11 +1049,21 @@ action:
       # the catch-all. But the same restart can power-cycle the track fixtures (it did
       # that night), and syncing the switch to a light showing its boot glow would turn
       # the switch ON. So when the light is ON at the boot level with a context HA
-      # minted for a device report, it is a recovery: the store is restored and the
-      # switch follows that. The store is not used otherwise: it can lag the light
-      # (it is written only on the observe path), and a restore re-sends brightness and
-      # colour to a light that is already right. Priming follows light_recovered's
-      # rules (with quiet_recovery, only inside the host-boot window).
+      # minted for a device report (`boot_glow`), it is a recovery: the store is
+      # restored and the switch follows that. Priming follows light_recovered's rules
+      # (with quiet_recovery, only inside the host-boot window).
+      #
+      # Since integration 0.6.0 a detected CLU restart (`clu_restarted`) is a recovery
+      # too: the switch holds a boot default, the store holds the last state anyone
+      # chose. Without a boot glow it is a BARE restore (`bare_restore`): on/off from
+      # the store, no brightness/colour (the store's are from the last on/off, AL's
+      # are newer — re-sending them is a visible jump and an AL latch), no priming and
+      # no turn-on re-assert (a CLU restart does not touch the Zigbee link), no assert
+      # watch when the light already matches (no slot held), no AL release (nothing
+      # attributed, and a genuine manual override survives). Usually the light already
+      # matches the store and the run only puts the switch back.
+      # A wall press during a Grenton outage never gets here: `outage_press` routes it
+      # to Scenario A. Any other non-restart recovery stays observe.
       # ─────────────────────────────────────────────────────────────────────────
       - conditions:
           - condition: trigger
@@ -1070,12 +1159,17 @@ action:
                   dropped_into_boot: >-
                     {{ at_boot_level and
                        (not from_on or from_bri > recovery_brightness_threshold | int) }}
-                  # grenton_recovered is a recovery only when the light shows a boot
-                  # glow nothing in HA asked for (see the pipeline header); otherwise it
-                  # is observe and the switch simply follows the light.
+                  # A boot glow nothing in HA asked for.
+                  boot_glow: "{{ at_boot_level and live_device }}"
+                  # grenton_recovered is a recovery after a detected CLU restart, or
+                  # when the light shows a boot glow (see the pipeline header);
+                  # otherwise it is observe and the switch simply follows the light.
                   is_recovery: >-
                     {{ trigger.id in ['light_recovered', 'ha_start']
-                       or (trigger.id == 'grenton_recovered' and at_boot_level and live_device) }}
+                       or (trigger.id == 'grenton_recovered' and (clu_restarted or boot_glow)) }}
+                  # A CLU-restart restore with no boot glow: on/off only, nothing else.
+                  # Only meaningful when intent == 'restore'.
+                  bare_restore: "{{ trigger.id == 'grenton_recovered' and not boot_glow }}"
                   # SELF-BOOT: the bulb powered itself up. It went off → on, came up at
                   # the firmware boot level, and nothing in HA asked for it. The light
                   # never went unavailable, so none of the recovery triggers fired — but
@@ -1106,7 +1200,7 @@ action:
                   # already matches instead of re-commanding a light nobody touched.
                   apply_data: >-
                     {{ restore_data
-                       if (intent == 'restore' and saved.get('state') == 'on')
+                       if (intent == 'restore' and saved.get('state') == 'on' and not bare_restore)
                        else ({'brightness': prime_brightness | int} if needs_wake else {}) }}
                   # Whether priming may run. Only HA start is gated: a plain Core
                   # restart leaves the lights powered and their Zigbee link intact, so
@@ -1132,11 +1226,13 @@ action:
                     {{ host_boot_ts is not none and
                        now().timestamp() - host_boot_ts <= host_boot_window | float(10) * 60 }}
                   # grenton_recovered (a boot glow found when the Grenton switch comes
-                  # back, see the pipeline header) is gated like light_recovered.
+                  # back, see the pipeline header) is gated like light_recovered. A bare
+                  # restore (a CLU restart without a boot glow) never primes.
                   prime_allowed: >-
-                    {{ trigger.id not in (['ha_start', 'light_recovered', 'grenton_recovered']
-                                          if quiet_recovery else ['ha_start'])
-                       or host_boot_ts is none or boot_recent }}
+                    {{ not (intent == 'restore' and bare_restore)
+                       and (trigger.id not in (['ha_start', 'light_recovered', 'grenton_recovered']
+                                               if quiet_recovery else ['ha_start'])
+                            or host_boot_ts is none or boot_recent) }}
                   # Set by the wait-for-Zigbee loop below when the user presses the wall
                   # switch while Zigbee is not delivering: from then on the live switch,
                   # not the snapshot, is the target. Always false without quiet_recovery.
@@ -1406,11 +1502,12 @@ action:
               # the loop would command nothing yet still spend its full watch window
               # holding the mode:single slot — delaying the switch sync below by
               # several seconds on every single press. Skip it in that case; a state
-              # HA never commanded is not one this run put at risk.
+              # HA never commanded is not one this run put at risk. The same holds for a
+              # bare restore (a CLU restart) whose light already matches the store.
               - if:
                   - condition: template
                     value_template: >-
-                      {{ intent == 'restore' or needs_wake or
+                      {{ (intent == 'restore' and not bare_restore) or needs_wake or
                          states(target_light_id) != target_state }}
                 then:
                   - repeat:
@@ -1600,16 +1697,20 @@ action:
               # target (a press during a restore's prime/assert is still not covered),
               # because the switch change most likely to land inside a restore is a
               # Grenton CLU restart's boot default, which must not drive the light.
+              # A CLU restart detected during this run is not a press (see Scenario A).
               # Same rule, same expression, at the end of Scenario A — keep in lockstep.
               - if:
                   - condition: template
                     value_template: >-
                       {{ intent == 'observe'
+                         and switch_at_start in ['on', 'off']
                          and states(grenton_switch_id) in ['on', 'off']
                          and states(target_light_id) in ['on', 'off']
                          and states(grenton_switch_id) != states(target_light_id)
                          and as_timestamp(states[grenton_switch_id].last_changed)
-                               > run_started | float }}
+                               > run_started | float
+                         and (as_timestamp(state_attr(clu_boot_sensor_id, 'restart_detected_at'), none)
+                              or 0) < run_started | float }}
                 then:
                   - choose:
                       - conditions:
@@ -1744,7 +1845,7 @@ action:
               - if:
                   - condition: template
                     value_template: >-
-                      {{ reassert_after_turn_on and intent == 'restore'
+                      {{ reassert_after_turn_on and intent == 'restore' and not bare_restore
                          and is_state(target_light_id, 'on')
                          and is_state(grenton_switch_id, 'on') }}
                 then:
@@ -1769,7 +1870,8 @@ action:
               # (apply_data is empty, bare turn_off), so there is nothing for AL to have
               # latched. Only the restore and needs_wake paths attribute the light;
               # ordinary observe on/off does not, hence the intent test rather than
-              # clearing unconditionally.
+              # clearing unconditionally. A bare restore (a CLU restart) attributes
+              # nothing, so it releases nothing — a genuine manual override survives.
               #
               # entity_id targets the AL switch; `lights` scopes the clear to this one
               # light so sibling lights on the same AL instance keep any genuine manual
@@ -1779,7 +1881,7 @@ action:
               - if:
                   - condition: template
                     value_template: >-
-                      {{ has_al and (intent == 'restore' or needs_wake)
+                      {{ has_al and ((intent == 'restore' and not bare_restore) or needs_wake)
                          and is_state(target_light_id, 'on') }}
                 then:
                   - delay: "00:00:01"
@@ -1802,7 +1904,8 @@ action:
       # light_source_of_truth instances, and on restore_previous instances with no
       # state store configured. A Grenton CLU restart (integration ≥ 0.5.0: unavailable
       # → boot default) lands here on those instances, so the switch is put back to
-      # what the light shows instead of the light following the boot default.
+      # what the light shows instead of the light following the boot default. (A
+      # press made during an outage was claimed by Scenario A, see outage_press.)
       #
       # `light_changed` is HERE, not only in the pipeline, on purpose: the pipeline is
       # gated on `restore_previous and has_store`, so on a source-of-truth instance an
